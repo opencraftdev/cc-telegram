@@ -147,7 +147,11 @@ impl Config {
     }
 }
 
+/// `$CC_GATEWAY_HOME`, else `~/.cc-gateway`.
 pub fn home() -> PathBuf {
+    if let Some(h) = std::env::var_os("CC_GATEWAY_HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(h);
+    }
     dirs::home_dir()
         .expect("no home directory")
         .join(".cc-gateway")

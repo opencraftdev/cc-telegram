@@ -280,6 +280,16 @@ pub async fn shutdown_on_signal() {
     std::process::exit(0);
 }
 
+/// What `/start` sends to claude for an allowlisted user.
+pub const START_PROMPT: &str = "/start (user opened the chat — greet them)";
+
+fn sender_label(user: &teloxide::types::User) -> String {
+    match &user.username {
+        Some(u) => format!("{} (@{u})", user.full_name()),
+        None => user.full_name(),
+    }
+}
+
 /// `/cmd@bot args` -> ("cmd", "args").
 pub fn parse_command(text: &str) -> Option<(String, &str)> {
     let rest = text.strip_prefix('/')?;
@@ -341,11 +351,19 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
     if let Some((c, args)) = cmd {
         match c.as_str() {
             "start" => {
-                reply(format!(
-                    "👋 Hi {}! Your user id is {uid}. Send me anything.",
-                    user.first_name
-                ))
-                .await?;
+                // A normal turn, so the greeting is in character (SOUL) and can pick up where
+                // the last session / imported history left off.
+                enqueue(
+                    &app,
+                    Job {
+                        chat_id: chat.0,
+                        user_id: uid,
+                        prompt: START_PROMPT.into(),
+                        scheduled: false,
+                        sender: sender_label(user),
+                        typing: Some(TypingGuard::start(app.bot.clone(), chat)),
+                    },
+                );
                 return Ok(());
             }
             "pair" => {
@@ -498,10 +516,7 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
             user_id: uid,
             prompt,
             scheduled: false,
-            sender: match &user.username {
-                Some(u) => format!("{} (@{u})", user.full_name()),
-                None => user.full_name(),
-            },
+            sender: sender_label(user),
             typing: Some(typing),
         },
     );
@@ -532,6 +547,204 @@ async fn on_callback(app: Arc<App>, q: CallbackQuery) -> Result<()> {
         app.bot.edit_message_text(m.chat().id, m.id(), text).await?;
     }
     Ok(())
+}
+
+/// Whose turn a run is.
+pub struct TurnFor<'a> {
+    pub chat_id: i64,
+    pub user_id: u64,
+    pub sender: &'a str,
+    pub message: &'a str,
+    pub scheduled: bool,
+}
+
+pub struct ChatTurn {
+    pub opts: RunOpts,
+    /// HISTORY.md was injected (mark it done once a session is stored).
+    pub with_history: bool,
+}
+
+/// The claude run a Telegram message gets right now: prompt (SOUL, memory, notes, history),
+/// resume, cwd + skills dir, model. Shared by the bot and `cc-gateway prompt` / `ask`.
+pub fn chat_turn(
+    profile: &Profile,
+    cfg: &crate::profile::Config,
+    cs: &crate::state::ChatState,
+    t: &TurnFor,
+    extra_prompt: &str,
+) -> Result<ChatTurn> {
+    let (cwd, cwd_args) = profile.claude_cwd(cfg);
+    // Imported chat history: only until this chat's first session is stored, then never.
+    let history_path = profile.ns_dir(&t.chat_id.to_string()).join("HISTORY.md");
+    let history = (!t.scheduled && cs.session_id.is_none() && !cs.history_done)
+        .then(|| std::fs::read_to_string(&history_path).ok())
+        .flatten()
+        .filter(|h| !h.trim().is_empty());
+    let with_history = history.is_some();
+    let outbox = profile.outbox(t.chat_id);
+    std::fs::create_dir_all(&outbox)?;
+    let system_prompt = prompt::assemble(
+        profile,
+        &t.user_id.to_string(),
+        prompt::Channel::Telegram {
+            sender: t.sender.to_string(),
+            outbox,
+        },
+        &cwd,
+        history,
+    )? + extra_prompt;
+    Ok(ChatTurn {
+        opts: RunOpts {
+            claude_bin: crate::profile::expand_tilde(&cfg.claude_bin)
+                .to_string_lossy()
+                .into(),
+            prompt: t.message.to_string(),
+            system_prompt,
+            model: cs.model.clone().unwrap_or(cfg.default_model.clone()),
+            max_turns: cfg.max_turns,
+            // cron runs get a fresh session so they don't pollute the chat context
+            resume: if t.scheduled {
+                None
+            } else {
+                cs.session_id.clone()
+            },
+            extra_args: [cwd_args, cfg.extra_claude_args.clone()].concat(),
+            cwd,
+            timeout: Duration::from_secs(cfg.run_timeout_secs),
+        },
+        with_history,
+    })
+}
+
+/// The prompt line `ask --dry` adds.
+pub const DRY_RUN_PROMPT: &str = "\n\n# Dry run\nThis is a test turn from the operator's terminal \
+     (cc-gateway ask --dry). Do not create, edit or delete any files, including the memory files, \
+     and don't run commands that change anything; just answer.";
+
+/// Load what `prompt` / `ask` need for a chat. `user` defaults to the chat id (a DM).
+fn cli_turn(
+    profile: &Profile,
+    chat: i64,
+    user: Option<u64>,
+    message: &str,
+    extra: &str,
+) -> Result<(crate::profile::Config, StateStore, ChatTurn, u64)> {
+    let cfg = profile.load_config()?;
+    let uid = match user {
+        Some(u) => u,
+        None if chat > 0 => chat as u64,
+        None => {
+            anyhow::bail!("✗ chat {chat} is a group → pass the sender: --user <telegram user id>")
+        }
+    };
+    if !cfg.is_allowed(uid) {
+        eprintln!(
+            "note: user {uid} is not on {}'s allowlist; the bot would ignore them",
+            profile.name
+        );
+    }
+    let state = StateStore::open(profile.state_path());
+    let cs = state.get(chat);
+    let turn = chat_turn(
+        profile,
+        &cfg,
+        &cs,
+        &TurnFor {
+            chat_id: chat,
+            user_id: uid,
+            sender: "the user of this chat (via cc-gateway ask; name unknown)",
+            message,
+            scheduled: false,
+        },
+        extra,
+    )?;
+    Ok((cfg, state, turn, uid))
+}
+
+/// `cc-gateway prompt <profile> --chat <id>`: the system prompt that chat gets right now.
+pub fn print_prompt(profile: &Profile, chat: i64, user: Option<u64>) -> Result<()> {
+    let (_, state, turn, _) = cli_turn(profile, chat, user, "", "")?;
+    let cs = state.get(chat);
+    eprintln!(
+        "# chat {chat}: session {}, model {}, cwd {}{}",
+        cs.session_id
+            .as_deref()
+            .unwrap_or("none (next message starts one)"),
+        turn.opts.model,
+        turn.opts.cwd.display(),
+        if turn.with_history {
+            ", HISTORY.md injected"
+        } else {
+            ""
+        }
+    );
+    print!("{}", turn.opts.system_prompt);
+    Ok(())
+}
+
+/// `cc-gateway ask`: one headless turn as the Telegram path would run it, reply on stdout.
+/// `dry`: forks the session without persisting it, blocks file/shell tools, stores nothing.
+pub async fn ask(
+    profile: &Profile,
+    chat: i64,
+    user: Option<u64>,
+    message: &str,
+    model: Option<String>,
+    dry: bool,
+) -> Result<()> {
+    let extra = if dry { DRY_RUN_PROMPT } else { "" };
+    let (cfg, state, turn, _) = cli_turn(profile, chat, user, message, extra)?;
+    let mut opts = turn.opts;
+    if let Some(m) = model {
+        opts.model = m;
+    }
+    if dry {
+        opts.extra_args.extend(dry_args(opts.resume.is_some()));
+    }
+    runner::set_max_runs(cfg.max_concurrent_runs);
+    let epoch = state.get(chat).epoch;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    match runner::run(&opts, tx, Arc::new(Notify::new())).await {
+        Outcome::Done(r) if !r.is_error => {
+            println!("{}", r.text);
+            if !dry && let Some(sid) = r.session_id {
+                SessionOwners::open(profile.sessions_path()).claim(&sid, &format!("tg:{chat}"));
+                state.set_session_if(chat, epoch, sid);
+                state.update(chat, |c| {
+                    c.last_cost_usd = Some(r.cost_usd);
+                    c.history_done |= turn.with_history;
+                });
+            }
+            Ok(())
+        }
+        Outcome::Done(r) if opts.resume.is_some() && r.is_stale_session() => anyhow::bail!(
+            "✗ the chat's saved session no longer exists → send /new in the chat, or run without it"
+        ),
+        Outcome::Done(r) => anyhow::bail!("✗ claude error: {} {}", r.text, r.errors.join("; ")),
+        Outcome::TimedOut(_) => anyhow::bail!("✗ timed out after {}s", cfg.run_timeout_secs),
+        Outcome::Stopped(_) => anyhow::bail!("✗ stopped"),
+        Outcome::Failed(e) => anyhow::bail!("✗ claude failed: {e} → run: cc-gateway doctor"),
+    }
+}
+
+/// Extra claude args for a dry run: no file/shell tools, nothing persisted, and a resumed
+/// session is forked so the real one isn't advanced.
+pub fn dry_args(resuming: bool) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "--disallowedTools",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash",
+        "--no-session-persistence",
+    ]
+    .map(String::from)
+    .into();
+    if resuming {
+        a.push("--fork-session".into());
+    }
+    a
 }
 
 /// Run one queued job: status message, claude run, reply, outbox, persist session.
@@ -579,43 +792,21 @@ async fn try_run_job(
         .ok()
         .map(|m| m.id);
     let started = Instant::now();
-    let (cwd, cwd_args) = app.profile.claude_cwd(&cfg);
-    // Imported chat history: only until this chat's first session is stored, then never.
-    let history_path = app
-        .profile
-        .ns_dir(&job.chat_id.to_string())
-        .join("HISTORY.md");
-    let history = (!job.scheduled && cs.session_id.is_none() && !cs.history_done)
-        .then(|| std::fs::read_to_string(&history_path).ok())
-        .flatten()
-        .filter(|h| !h.trim().is_empty());
-    let with_history = history.is_some();
-    let outbox = app.profile.outbox(job.chat_id);
-    std::fs::create_dir_all(&outbox)?;
-    let system_prompt = prompt::assemble(
+    let turn = chat_turn(
         &app.profile,
-        &job.user_id.to_string(),
-        prompt::Channel::Telegram {
-            sender: job.sender.clone(),
-            outbox,
+        &cfg,
+        &cs,
+        &TurnFor {
+            chat_id: job.chat_id,
+            user_id: job.user_id,
+            sender: &job.sender,
+            message: &job.prompt,
+            scheduled: job.scheduled,
         },
-        &cwd,
-        history,
+        "",
     )?;
-    let mut opts = RunOpts {
-        claude_bin: crate::profile::expand_tilde(&cfg.claude_bin)
-            .to_string_lossy()
-            .into(),
-        prompt: job.prompt.clone(),
-        system_prompt,
-        model: cs.model.unwrap_or(cfg.default_model.clone()),
-        max_turns: cfg.max_turns,
-        // cron runs get a fresh session so they don't pollute the chat context
-        resume: if job.scheduled { None } else { cs.session_id },
-        extra_args: [cwd_args, cfg.extra_claude_args.clone()].concat(),
-        cwd,
-        timeout: Duration::from_secs(cfg.run_timeout_secs),
-    };
+    let with_history = turn.with_history;
+    let mut opts = turn.opts;
     let mut note = "";
     let mut outcome = run_with_status(app, chat, status, &header, &opts, stop.clone()).await;
     let stale = match &outcome {
@@ -947,6 +1138,53 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(8010)).await;
         assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn dry_args_block_writes_and_fork_only_when_resuming() {
+        let a = dry_args(false);
+        assert!(a.contains(&"--no-session-persistence".to_string()));
+        assert!(!a.contains(&"--fork-session".to_string()));
+        assert!(
+            ["Edit", "Write", "Bash"]
+                .iter()
+                .all(|t| a.contains(&t.to_string()))
+        );
+        assert!(dry_args(true).contains(&"--fork-session".to_string()));
+    }
+
+    #[test]
+    fn chat_turn_injects_history_until_done_and_resumes() {
+        let t = tempfile::tempdir().unwrap();
+        let cfg = crate::profile::Config::new(String::new());
+        let p = Profile::create_at(t.path().join("p"), "t", &cfg).unwrap();
+        std::fs::create_dir_all(p.ns_dir("42")).unwrap();
+        std::fs::write(
+            p.ns_dir("42").join("HISTORY.md"),
+            "**User**: about the boat",
+        )
+        .unwrap();
+        let tf = TurnFor {
+            chat_id: 42,
+            user_id: 42,
+            sender: "Ana",
+            message: "halo",
+            scheduled: false,
+        };
+        let mut cs = crate::state::ChatState::default();
+        let turn = chat_turn(&p, &cfg, &cs, &tf, DRY_RUN_PROMPT).unwrap();
+        assert!(turn.with_history && turn.opts.system_prompt.contains("about the boat"));
+        assert!(turn.opts.system_prompt.ends_with("just answer."));
+        assert_eq!(
+            (turn.opts.prompt.as_str(), turn.opts.resume.clone()),
+            ("halo", None)
+        );
+        cs.session_id = Some("s1".into());
+        let turn = chat_turn(&p, &cfg, &cs, &tf, "").unwrap();
+        assert!(!turn.with_history && turn.opts.resume.as_deref() == Some("s1"));
+        cs.session_id = None;
+        cs.history_done = true;
+        assert!(!chat_turn(&p, &cfg, &cs, &tf, "").unwrap().with_history);
     }
 
     fn io_err() -> teloxide::RequestError {

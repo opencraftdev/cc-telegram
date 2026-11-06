@@ -87,6 +87,15 @@ pub fn build(p: &Parts) -> String {
              Answer in Markdown."
         ),
     });
+    out.push(
+        "# Greetings\n\
+         On a greeting or the first message of a new conversation (including /start), introduce \
+         yourself in character as SOUL.md describes (name, role, language, tone) in one or two \
+         sentences. If the earlier conversation or memory below shows what you and this person \
+         were last working on, mention it briefly and offer to continue. Keep it short; don't list \
+         your capabilities."
+            .into(),
+    );
     if let Some((name, content)) = &p.context_file {
         out.push(format!("# Project context ({name})\n\n{}", content.trim()));
     }
@@ -229,6 +238,7 @@ mod tests {
             at("# Identity"),
             at("You are Budi."),
             at("talking with Ana (@ana)"),
+            at("# Greetings"),
             at("# Project context (AGENTS.md)"),
             at("# Memory"),
             at("MEMORY (shared notes for this bot) ["),

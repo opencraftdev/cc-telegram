@@ -580,7 +580,8 @@ pub fn import_files(f: &Found, p: &Profile, confirm: &mut dyn FnMut(&Path) -> bo
         let res = dst
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::copy(src, &dst));
+            .and_then(|_| std::fs::read(src))
+            .and_then(|b| std::fs::write(&dst, clean_text(&String::from_utf8_lossy(&b))));
         rows.push((
             item.into(),
             match res {
@@ -782,6 +783,14 @@ pub fn read_history(db: &Path, per_chat: usize) -> Result<HashMap<i64, Vec<Msg>>
     Ok(out)
 }
 
+/// Drop NUL and other C0 control characters (keeping `\n` and `\t`): Hermes data can contain
+/// them, and they'd break the claude spawn or the prompt.
+pub fn clean_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_ascii_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
 /// HISTORY.md: oldest first, long messages trimmed.
 pub fn format_history(msgs: &[Msg]) -> String {
     let mut s = format!(
@@ -796,7 +805,7 @@ pub fn format_history(msgs: &[Msg]) -> String {
                     .to_string()
             })
             .unwrap_or_default();
-        let text = crate::runner::truncate(m.text.trim(), 1200);
+        let text = crate::runner::truncate(clean_text(&m.text).trim(), 1200);
         s.push_str(&format!(
             "\n**{}** ({when}): {text}\n",
             if m.user { "User" } else { "Assistant" }
@@ -1317,5 +1326,27 @@ mod tests {
         assert_eq!(scan(&t.path().join("h")).workdir, Some(wd));
         write(&t.path().join("h/config.yaml"), "terminal:\n  cwd: .\n");
         assert_eq!(scan(&t.path().join("h")).workdir, None); // relative: ignored
+    }
+
+    #[test]
+    fn imported_text_has_no_control_chars() {
+        assert_eq!(clean_text("a\0b\x07c\r\n\td\x7f"), "abc\n\td");
+        let h = format_history(&[Msg {
+            user: true,
+            text: "hi\0 there\x1b[31m".into(),
+            at: 0.0,
+        }]);
+        assert!(h.contains("hi there[31m") && !h.contains('\0'));
+        let t = tempfile::tempdir().unwrap();
+        write(&t.path().join("h/SOUL.md"), "I am\0 soul\r\n");
+        write(&t.path().join("h/memories/MEMORY.md"), "fact\0\n§\nother");
+        let f = scan(&t.path().join("h"));
+        let p = profile(&t.path().join("cct"));
+        import_files(&f, &p, &mut |_| true);
+        assert_eq!(fs::read_to_string(p.soul_path()).unwrap(), "I am soul\n");
+        assert_eq!(
+            fs::read_to_string(p.dir.join("MEMORY.md")).unwrap(),
+            "fact\n§\nother"
+        );
     }
 }

@@ -20,7 +20,7 @@ Allowlist changes apply right away. The bot re-reads `config.toml` for every mes
 
 | Command | Action |
 |---------|--------|
-| `/start` | Greeting and your Telegram user id |
+| `/start` | A greeting in character (per SOUL.md) that mentions what you last worked on, if anything (imported history or memory) |
 | `/pair <code>` | Join the allowlist with a pair code |
 | `/new` | Start a new Claude session for this chat (memory files are kept) |
 | `/stop` | Kill the running job and clear this chat's queue |
