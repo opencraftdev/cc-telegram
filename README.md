@@ -1,66 +1,67 @@
-# cc-telegram
+# cc-gateway
 
-A Telegram bot that forwards your messages to **Claude Code** (`claude -p`) on your own machine and sends the answers back, with live tool progress, per-chat sessions, per-user memory, files, voice notes and cron schedules. One Rust binary: both the CLI and the bot daemon.
+**Use Claude Code on your own machine from Telegram, or from any OpenAI-compatible client.**
+
+`cc-gateway` is one Rust binary that sits in front of `claude -p` (Claude Code in headless mode). Each profile can run two gateways:
+
+- **Telegram**: a private bot with live tool progress, per-chat sessions, per-user memory, photos/files/voice notes, and cron schedules.
+- **API**: an OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`) plus a native runs API with streaming tool events.
+
+It runs on **your Claude subscription** through your local Claude Code login. You don't need an Anthropic API key.
+
+> ⚠️ Claude runs with full tool access (`--dangerously-skip-permissions`). Anyone on the Telegram allowlist and anyone holding an API key can run commands as your OS user. Read [docs/security.md](docs/security.md).
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/opencraftdev/cc-telegram/main/install.sh | sh
-cc-telegram setup
+curl -fsSL https://raw.githubusercontent.com/opencraftdev/cc-gateways/main/install.sh | sh
+cc-gateway setup
 ```
 
-Also: `brew install opencraftdev/tap/cc-telegram` or `cargo install cc-telegram`.
+Other channels: `brew install opencraftdev/tap/cc-gateway` or `cargo install cc-gateway`.
 
-Needs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and logged in (`npm i -g @anthropic-ai/claude-code`, then run `claude` once). Voice notes optionally need `ffmpeg` and `whisper-cli` (`brew install ffmpeg whisper-cpp`).
+Requirements: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), installed and logged in (`npm i -g @anthropic-ai/claude-code`, then run `claude` once). macOS or Linux.
 
-## Setup
+## Quickstart: Telegram
 
-`cc-telegram setup` walks you through it: it checks Claude Code, asks for a bot token from @BotFather, pairs you by having you press **Start** in your bot (no user-id hunting), then asks for a model and voice notes and installs a background service. Pressing Enter all the way through works, except the "Is this you?" pairing check, which needs an explicit `y`.
+1. Run `cc-gateway setup` and answer **Yes** to "Enable Telegram?".
+2. Paste a bot token from @BotFather.
+3. Open your bot and press **Start**. Confirm "Is this you?" with `y`.
+4. Choose a model. Say yes to running it in the background.
 
-Non-interactive:
+Then chat with your bot. To add a friend, run `cc-gateway pair <profile>`; they send the printed `/pair 123456` to the bot. See [docs/telegram.md](docs/telegram.md).
+
+## Quickstart: API
 
 ```bash
-cc-telegram setup --token "$TOKEN" --profile work --model sonnet --service --no-voice
-# prints a /pair code to send to the bot
+cc-gateway setup --api --profile api      # API-only profile; prints a ccg_ key once
+cc-gateway run api                         # or: cc-gateway service install api
 ```
 
-Coming from [Hermes Agent](https://github.com/NousResearch/hermes-agent)? `setup` detects `~/.hermes` (or `$HERMES_HOME`) and offers to import the bot token, allowlist, `SOUL.md`, memories, model (Claude models only) and skills. Standalone: `cc-telegram import hermes [--profile <name>] [--hermes-home <path>] [--yes]`. Stop the Hermes gateway first (`hermes gateway stop`) or use a new bot: two processes polling one token get `409 Conflict`.
-
-Add a friend: `cc-telegram pair <profile>` prints `/pair 123456`. They send it to the bot within 10 minutes. Codes are single-use, and 5 wrong attempts lock that user out.
-
-## CLI
-
-```
-cc-telegram setup                      # guided wizard (also runs on first launch)
-cc-telegram pair <name>                # one-time code to add another user
-cc-telegram update | uninstall
-cc-telegram profile create|list|edit|delete <name>
-cc-telegram allow|deny <name> <user_id>
-cc-telegram run <name>                 # foreground
-cc-telegram service install|uninstall|status <name>
-cc-telegram doctor                     # checks claude, login, tokens, service, ffmpeg, whisper
-cc-telegram import hermes [--profile <name>] [--hermes-home <path>] [--yes]
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $CCG_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"sonnet","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Data lives in `~/.cc-telegram/profiles/<name>/`: `config.toml` (0600), `SOUL.md`, `state.json`, `logs/`, `users/<id>/{MEMORY.md,USER.md,schedules.json}`, and `workspace/` (cwd for every run, with `inbox/` and `outbox/`).
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="ccg_...")
+print(client.chat.completions.create(model="sonnet", messages=[{"role": "user", "content": "Hello"}]).choices[0].message.content)
+```
 
-## Chat commands
+See [docs/api.md](docs/api.md).
 
-| Command | Action |
-|---|---|
-| `/start` | Greeting + your user id |
-| `/new` | Start a new session (memory files stay) |
-| `/stop` | Kill the running job and clear the queue |
-| `/status` | Model, session, queue, running time, last cost |
-| `/model <opus\|sonnet\|haiku\|id>` | Model for this chat |
-| `/memory` / `/forget` | Show / wipe your MEMORY.md + USER.md |
-| `/schedule <m h dom mon dow> <prompt>` | Add a cron job (local time) |
-| `/schedules` / `/unschedule <id>` | List / remove jobs |
+## Documentation
 
-Photos, documents and voice notes are passed to Claude as files in the workspace. Files Claude writes to `outbox/<chat_id>/` are sent back.
+- [Getting started](docs/getting-started.md)
+- [Telegram gateway](docs/telegram.md): commands, pairing, media, schedules
+- [API gateway](docs/api.md): auth, endpoints, OpenAI SDK examples, streaming, sessions, native runs
+- [Configuration](docs/configuration.md): full `config.toml` reference
+- [Profiles and background service](docs/profiles-and-service.md)
+- [Importing from Hermes Agent](docs/hermes-import.md)
+- [Security](docs/security.md)
+- [Architecture](docs/architecture.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
-## ⚠️ Security
-
-Claude runs with `--dangerously-skip-permissions`: **every allowlisted user can run arbitrary commands as your OS user** (shell, file edits, web). Only allowlist people you would hand your laptop to. Messages from anyone else are dropped before any download or spawn, and logged. The bot token is stored in `config.toml` with mode 0600 and is never logged. Claude inherits the daemon's environment, so keep it free of secrets.
-
-Per-user memory separation only prevents *accidental* leakage. Because Claude has full file access, any allowlisted user can ask it to read `config.toml` (your bot token), other users' `MEMORY.md`/`USER.md`, or any file your OS user can read.
+Formerly `cc-telegram`. An existing `~/.cc-telegram` is moved to `~/.cc-gateway` automatically the first time you run it.

@@ -1,3 +1,4 @@
+mod api;
 mod bot;
 mod hermes;
 mod media;
@@ -17,9 +18,9 @@ use std::io::IsTerminal;
 
 #[derive(Parser)]
 #[command(
-    name = "cc-telegram",
+    name = "cc-gateway",
     version,
-    about = "Telegram bot that forwards messages to Claude Code (claude -p) on your machine"
+    about = "Telegram bot + OpenAI-compatible API in front of Claude Code (claude -p) on your machine"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,13 +29,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Guided setup wizard (or non-interactive with --token)
+    /// Guided setup wizard (non-interactive with --token, --api or --import-hermes)
     Setup(setup::SetupArgs),
     /// Print a one-time code that adds another user: they send /pair <code>
     Pair { name: String },
     /// Update to the latest release
     Update,
-    /// Remove services and the binary (asks before deleting ~/.cc-telegram)
+    /// Remove services and the binary (asks before deleting ~/.cc-gateway)
     Uninstall,
     /// Manage profiles
     #[command(subcommand)]
@@ -43,8 +44,11 @@ enum Cmd {
     Allow { name: String, user_id: u64 },
     /// Remove a Telegram user id from the allowlist
     Deny { name: String, user_id: u64 },
-    /// Run the bot in the foreground
+    /// Run the profile's enabled gateways (Telegram, API) in the foreground
     Run { name: String },
+    /// API keys for the HTTP API gateway
+    #[command(subcommand)]
+    Key(KeyCmd),
     /// Background service (launchd / systemd)
     #[command(subcommand)]
     Service(ServiceCmd),
@@ -59,7 +63,7 @@ enum Cmd {
 enum ImportCmd {
     /// Import Hermes Agent (token, allowlist, SOUL.md, memories, model, skills)
     Hermes {
-        /// cc-telegram profile name for the Hermes root profile (default: "default")
+        /// cc-gateway profile name for the Hermes root profile (default: "default")
         #[arg(long)]
         profile: Option<String>,
         /// Hermes home (default: $HERMES_HOME or ~/.hermes)
@@ -89,6 +93,22 @@ enum ProfileCmd {
 }
 
 #[derive(Subcommand)]
+enum KeyCmd {
+    /// Create a key (printed once; only its sha256 is stored)
+    Create {
+        profile: String,
+        name: String,
+    },
+    List {
+        profile: String,
+    },
+    Revoke {
+        profile: String,
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ServiceCmd {
     Install { name: String },
     Uninstall { name: String },
@@ -105,6 +125,7 @@ async fn main() {
 
 async fn real_main() -> Result<()> {
     let cli = Cli::parse();
+    profile::migrate_home();
     match cli.cmd {
         None if profile::list().is_empty() => setup::setup(setup::SetupArgs::default()).await,
         None => {
@@ -158,8 +179,13 @@ async fn real_main() -> Result<()> {
         Some(Cmd::Run { name }) => {
             let p = Profile::open(&name)?;
             let _guard = init_logging(&p)?;
-            bot::run(p).await
+            run_gateways(p).await
         }
+        Some(Cmd::Key(k)) => setup::key(match k {
+            KeyCmd::Create { profile, name } => (profile, Some(name), true),
+            KeyCmd::List { profile } => (profile, None, false),
+            KeyCmd::Revoke { profile, name } => (profile, Some(name), false),
+        }),
         Some(Cmd::Service(s)) => match s {
             ServiceCmd::Install { name } => {
                 service::install(&Profile::open(&name)?)?;
@@ -176,7 +202,7 @@ async fn real_main() -> Result<()> {
                 profile::validate_name(&name)?;
                 let state = match (service::is_installed(&name), service::is_running(&name)) {
                     (false, _) => {
-                        format!("not installed → run: cc-telegram service install {name}")
+                        format!("not installed → run: cc-gateway service install {name}")
                     }
                     (true, true) => "running".into(),
                     (true, false) => {
@@ -204,13 +230,44 @@ async fn real_main() -> Result<()> {
             let done = setup::import_hermes(&home, profile, interactive, yes, None).await?;
             for (p, bot) in &done {
                 println!(
-                    "\n✅ {} → https://t.me/{bot}  (start: cc-telegram run {0} or service install {0})",
+                    "\n✅ {} → https://t.me/{bot}  (start: cc-gateway run {0} or service install {0})",
                     p.name
                 );
             }
             Ok(())
         }
     }
+}
+
+/// Start every enabled gateway of a profile; they share one set of queues.
+async fn run_gateways(p: Profile) -> Result<()> {
+    let cfg = p.load_config()?;
+    let (tg, api) = (cfg.telegram_enabled(), cfg.api.enabled);
+    if !tg && !api {
+        anyhow::bail!(
+            "✗ profile {0} has no gateway enabled (no bot_token, [api] enabled = false) → run: cc-gateway profile edit {0}",
+            p.name
+        );
+    }
+    tokio::spawn(bot::shutdown_on_signal());
+    let queues = std::sync::Arc::new(queue::Queues::default());
+    let owners = std::sync::Arc::new(state::SessionOwners::open(p.sessions_path()));
+    let telegram = async {
+        if tg {
+            bot::run(p.clone(), queues.clone(), owners.clone()).await
+        } else {
+            Ok(())
+        }
+    };
+    let http = async {
+        if api {
+            api::serve(p.clone(), queues.clone(), owners.clone()).await
+        } else {
+            Ok(())
+        }
+    };
+    tokio::try_join!(telegram, http)?;
+    Ok(())
 }
 
 /// Log to logs/bot.log (and stdout when attached to a terminal).

@@ -15,7 +15,7 @@ use teloxide::prelude::*;
 use teloxide::types::UpdateKind;
 
 const INSTALL_SH: &str =
-    "https://raw.githubusercontent.com/opencraftdev/cc-telegram/main/install.sh";
+    "https://raw.githubusercontent.com/opencraftdev/cc-gateways/main/install.sh";
 const WHISPER_MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
 const MODELS: [&str; 3] = ["sonnet", "opus", "haiku"];
@@ -43,6 +43,9 @@ pub struct SetupArgs {
     /// Don't offer to import Hermes Agent
     #[arg(long)]
     no_import_hermes: bool,
+    /// Enable the HTTP API gateway and create a key named "default" (printed once)
+    #[arg(long)]
+    api: bool,
 }
 
 fn ok(msg: impl std::fmt::Display) {
@@ -97,11 +100,11 @@ fn voice_deps(cfg: &Config) -> (bool, bool, bool) {
 // ---------- setup ----------
 
 pub async fn setup(a: SetupArgs) -> Result<()> {
-    if a.token.is_some() || a.import_hermes {
+    if a.token.is_some() || a.import_hermes || a.api {
         return non_interactive(a).await;
     }
-    println!("{}", style("cc-telegram setup").bold().cyan());
-    println!("Chat with Claude Code on this machine from Telegram.\n");
+    println!("{}", style("cc-gateway setup").bold().cyan());
+    println!("Use Claude Code on this machine from Telegram and/or an OpenAI-compatible API.\n");
     step(1, "Claude Code");
     check_claude_interactive()?;
     if !a.no_import_hermes
@@ -115,7 +118,7 @@ pub async fn setup(a: SetupArgs) -> Result<()> {
                     "\n{}",
                     style(format!("Finishing profile {}", p.name)).bold()
                 );
-                finish_profile(&p, cfg, &bot_name).await?;
+                finish_profile(&p, cfg, Some(&bot_name)).await?;
             }
             return Ok(());
         }
@@ -139,7 +142,7 @@ fn check_claude_interactive() -> Result<()> {
         }
         if claude_version("claude").is_none() {
             bail!(
-                "✗ claude still not found → run: npm i -g @anthropic-ai/claude-code, then: cc-telegram setup"
+                "✗ claude still not found → run: npm i -g @anthropic-ai/claude-code, then: cc-gateway setup"
             );
         }
     }
@@ -182,15 +185,34 @@ async fn ask_token() -> Result<(String, String)> {
 
 /// Wizard steps 2-8 (also `profile create`).
 pub async fn create_profile(name: Option<String>) -> Result<Profile> {
-    step(2, "Bot token");
-    let (token, bot_name) = ask_token().await?;
+    step(2, "Gateways");
+    let (telegram, api) = loop {
+        let tg = Confirm::new()
+            .with_prompt("Enable Telegram?")
+            .default(true)
+            .interact()?;
+        let api = Confirm::new()
+            .with_prompt("Enable API server (OpenAI-compatible, on 127.0.0.1:8787)?")
+            .default(false)
+            .interact()?;
+        if tg || api {
+            break (tg, api);
+        }
+        bad("enable at least one gateway");
+    };
+    let (token, bot_name) = if telegram {
+        let (t, b) = ask_token().await?;
+        (t, Some(b))
+    } else {
+        (String::new(), None)
+    };
 
     step(3, "Profile name");
     let name = match name {
         Some(n) => {
             profile::validate_name(&n)?;
             if profile::list().contains(&n) {
-                bail!("✗ profile {n:?} already exists → run: cc-telegram profile delete {n}");
+                bail!("✗ profile {n:?} already exists → run: cc-gateway profile delete {n}");
             }
             println!("  {n}");
             n
@@ -209,17 +231,20 @@ pub async fn create_profile(name: Option<String>) -> Result<Profile> {
             }
         },
     };
-    let cfg = Config::new(token);
+    let mut cfg = Config::new(token);
+    cfg.api.enabled = api;
     let p = Profile::create(&name, &cfg)?;
-    finish_profile(&p, cfg, &bot_name).await?;
+    finish_profile(&p, cfg, bot_name.as_deref()).await?;
     Ok(p)
 }
 
 /// Wizard steps 4-8 for a created profile (pairing is skipped if someone is allowlisted).
-async fn finish_profile(p: &Profile, mut cfg: Config, bot_name: &str) -> Result<()> {
+async fn finish_profile(p: &Profile, mut cfg: Config, bot_name: Option<&str>) -> Result<()> {
     let name = &p.name;
     step(4, "Pair yourself");
-    if cfg.allowed_user_ids.is_empty() {
+    if let Some(bot_name) = bot_name
+        && cfg.allowed_user_ids.is_empty()
+    {
         println!(
             "  Open {} and press Start (waiting 2 minutes)…",
             style(format!("https://t.me/{bot_name}")).underlined()
@@ -228,11 +253,18 @@ async fn finish_profile(p: &Profile, mut cfg: Config, bot_name: &str) -> Result<
             bad("no /start confirmed in time; pair later with the code below");
             print_pair_code(p)?;
         }
-    } else {
+    } else if bot_name.is_some() {
         ok(format!(
             "{} user(s) already allowed",
             cfg.allowed_user_ids.len()
         ));
+    } else {
+        println!("  (Telegram off: nothing to pair)");
+    }
+    if cfg.api.enabled && cfg.api.keys.is_empty() {
+        let key = create_key(p, "default")?;
+        cfg = p.load_config()?;
+        print_key(p, "default", &key, &cfg);
     }
 
     step(5, "Model");
@@ -264,17 +296,27 @@ async fn finish_profile(p: &Profile, mut cfg: Config, bot_name: &str) -> Result<
             Err(e) => bad(format!("{e:#}")),
         }
     } else {
-        println!("  Start it with: cc-telegram run {name}");
+        println!("  Start it with: cc-gateway run {name}");
     }
 
     println!("\n{}", style("🎉 All set!").bold().green());
-    println!("  Bot:     https://t.me/{bot_name}");
+    if let Some(b) = bot_name {
+        println!("  Bot:     https://t.me/{b}");
+    }
+    if cfg.api.enabled {
+        println!("  API:     http://{}/v1", cfg.api.bind);
+    }
     println!("  Profile: {}", p.dir.display());
     println!("  Useful commands:");
-    println!("    cc-telegram pair {name}             add a friend");
-    println!("    cc-telegram service status {name}   is it running?");
-    println!("    cc-telegram profile edit {name}     model, limits, allowlist");
-    println!("    cc-telegram doctor                  check everything");
+    if bot_name.is_some() {
+        println!("    cc-gateway pair {name}             add a friend");
+    }
+    if cfg.api.enabled {
+        println!("    cc-gateway key create {name} <n>   another API key");
+    }
+    println!("    cc-gateway service status {name}   is it running?");
+    println!("    cc-gateway profile edit {name}     model, limits, allowlist");
+    println!("    cc-gateway doctor                  check everything");
     Ok(())
 }
 
@@ -368,7 +410,7 @@ async fn voice_step(cfg: &mut Config) -> Result<()> {
                 .status()?;
         } else {
             bad(
-                "install ffmpeg and whisper.cpp (whisper-cli) with your package manager, then run: cc-telegram doctor",
+                "install ffmpeg and whisper.cpp (whisper-cli) with your package manager, then run: cc-gateway doctor",
             );
         }
     }
@@ -380,7 +422,7 @@ async fn voice_step(cfg: &mut Config) -> Result<()> {
     if cfg.voice.enabled {
         ok("voice notes enabled");
     } else {
-        bad("voice notes still missing deps; disabled → run: cc-telegram doctor");
+        bad("voice notes still missing deps; disabled → run: cc-gateway doctor");
     }
     Ok(())
 }
@@ -418,19 +460,24 @@ async fn non_interactive(a: SetupArgs) -> Result<()> {
         let imported =
             import_hermes(&home, a.profile.clone(), false, false, a.token.clone()).await?;
         if imported.is_empty() {
-            bail!("✗ nothing imported → run: cc-telegram setup");
+            bail!("✗ nothing imported → run: cc-gateway setup");
         }
         for (p, bot_name) in imported {
             let mut cfg = p.load_config()?;
-            if a.no_voice {
-                cfg.voice.enabled = false;
+            if a.no_voice || a.api {
+                cfg.voice.enabled &= !a.no_voice;
+                cfg.api.enabled |= a.api;
                 p.save_config(&cfg)?;
+            }
+            if a.api && cfg.api.keys.is_empty() {
+                let key = create_key(&p, "default")?;
+                print_key(&p, "default", &key, &p.load_config()?);
             }
             if a.service {
                 service::install(&p)?;
                 ok(format!("service installed and running for {}", p.name));
             } else {
-                println!("Start it with: cc-telegram run {}", p.name);
+                println!("Start it with: cc-gateway run {}", p.name);
             }
             if cfg.allowed_user_ids.is_empty() {
                 print_pair_code(&p)?;
@@ -440,14 +487,21 @@ async fn non_interactive(a: SetupArgs) -> Result<()> {
         return Ok(());
     }
     let token = a.token.unwrap_or_default();
-    let bot_name = get_me(&token).await.map_err(|e| {
-        anyhow::anyhow!("✗ token rejected by Telegram ({e}) → get a valid token from @BotFather")
-    })?;
-    ok(format!("Connected to @{bot_name}"));
+    let bot_name = if token.is_empty() {
+        None // API-only
+    } else {
+        let b = get_me(&token).await.map_err(|e| {
+            anyhow::anyhow!(
+                "✗ token rejected by Telegram ({e}) → get a valid token from @BotFather"
+            )
+        })?;
+        ok(format!("Connected to @{b}"));
+        Some(b)
+    };
     let name = a.profile.unwrap_or_else(|| "default".into());
     profile::validate_name(&name)?;
     if profile::list().contains(&name) {
-        bail!("✗ profile {name:?} already exists → run: cc-telegram profile delete {name}");
+        bail!("✗ profile {name:?} already exists → run: cc-gateway profile delete {name}");
     }
     let mut cfg = Config::new(token);
     if let Some(m) = a.model {
@@ -455,22 +509,103 @@ async fn non_interactive(a: SetupArgs) -> Result<()> {
     }
     let (ff, wh, model) = voice_deps(&cfg);
     cfg.voice.enabled = !a.no_voice && ff && wh && model;
+    cfg.api.enabled = a.api;
     let p = Profile::create(&name, &cfg)?;
     ok(format!("profile {name} created at {}", p.dir.display()));
+    if a.api {
+        let key = create_key(&p, "default")?;
+        print_key(&p, "default", &key, &p.load_config()?);
+    }
     if a.service {
         service::install(&p)?;
         ok("service installed and running");
     } else {
-        println!("Start it with: cc-telegram run {name}");
+        println!("Start it with: cc-gateway run {name}");
     }
-    print_pair_code(&p)?;
-    println!("Bot: https://t.me/{bot_name}");
+    if let Some(b) = bot_name {
+        print_pair_code(&p)?;
+        println!("Bot: https://t.me/{b}");
+    }
+    Ok(())
+}
+
+// ---------- API keys ----------
+
+/// Add a key (under the profile lock) and return the plaintext, which is never stored.
+fn create_key(p: &Profile, name: &str) -> Result<String> {
+    profile::validate_name(name).map_err(|_| {
+        anyhow::anyhow!("✗ invalid key name {name:?} → use letters, digits, '-' or '_'")
+    })?;
+    let _lock = p.lock()?;
+    let mut cfg = p.load_config()?;
+    if cfg.api.keys.iter().any(|k| k.name == name) {
+        bail!(
+            "✗ key {name:?} already exists → run: cc-gateway key revoke {} {name}",
+            p.name
+        );
+    }
+    let key = crate::api::new_key()?;
+    cfg.api.keys.push(profile::ApiKey {
+        name: name.into(),
+        sha256: crate::api::hash_key(&key),
+        created_at: chrono::Local::now().to_rfc3339(),
+    });
+    p.save_config(&cfg)?;
+    Ok(key)
+}
+
+fn print_key(p: &Profile, name: &str, key: &str, cfg: &Config) {
+    ok(format!(
+        "API key {name:?} created (shown once, store it now):"
+    ));
+    println!("  {}", style(key).bold());
+    if !cfg.api.enabled {
+        println!(
+            "  note: [api] enabled = false in profile {} → set it to true: cc-gateway profile edit {}",
+            p.name, p.name
+        );
+    }
+    println!(
+        "  try: curl http://{}/v1/models -H \"Authorization: Bearer {key}\"",
+        cfg.api.bind
+    );
+}
+
+/// `key create|list|revoke`: (profile, name, create?)
+pub fn key((profile, name, create): (String, Option<String>, bool)) -> Result<()> {
+    let p = Profile::open(&profile)?;
+    match (name, create) {
+        (Some(n), true) => {
+            let key = create_key(&p, &n)?;
+            print_key(&p, &n, &key, &p.load_config()?);
+        }
+        (Some(n), false) => {
+            let _lock = p.lock()?;
+            let mut cfg = p.load_config()?;
+            let before = cfg.api.keys.len();
+            cfg.api.keys.retain(|k| k.name != n);
+            if cfg.api.keys.len() == before {
+                bail!("✗ no key {n:?} → run: cc-gateway key list {profile}");
+            }
+            p.save_config(&cfg)?;
+            ok(format!("revoked {n} (takes effect on the next request)"));
+        }
+        (None, _) => {
+            let cfg = p.load_config()?;
+            if cfg.api.keys.is_empty() {
+                println!("no keys → run: cc-gateway key create {profile} <name>");
+            }
+            for k in &cfg.api.keys {
+                println!("{}\tcreated {}", k.name, k.created_at);
+            }
+        }
+    }
     Ok(())
 }
 
 // ---------- Hermes import ----------
 
-/// Import Hermes sources into cc-telegram profiles. Returns (profile, bot username) for each
+/// Import Hermes sources into cc-gateway profiles. Returns (profile, bot username) for each
 /// profile created or updated. `interactive` = prompts; `yes` = accept all + overwrite.
 pub async fn import_hermes(
     home: &std::path::Path,
@@ -525,7 +660,7 @@ pub async fn import_hermes(
         let name = match &src.name {
             Some(n) => n.clone(),
             None if ask => Input::new()
-                .with_prompt("cc-telegram profile name for the Hermes root profile")
+                .with_prompt("cc-gateway profile name for the Hermes root profile")
                 .default(root_name.clone().unwrap_or_else(|| "default".into()))
                 .interact_text()?,
             None => root_name.clone().unwrap_or_else(|| "default".into()),
@@ -568,7 +703,7 @@ pub async fn import_hermes(
                 token = Some(ask_token().await?);
             } else {
                 bad(format!(
-                    "skipped {name}: no valid bot token → run: cc-telegram setup --token <TOKEN> --import-hermes"
+                    "skipped {name}: no valid bot token → run: cc-gateway setup --token <TOKEN> --import-hermes"
                 ));
                 continue;
             }
@@ -698,7 +833,7 @@ fn print_pair_code(p: &Profile) -> Result<()> {
         style(format!("/pair {code}")).bold()
     );
     println!(
-        "(the bot must be running: cc-telegram run {0}  or  cc-telegram service install {0})",
+        "(the bot must be running: cc-gateway run {0}  or  cc-gateway service install {0})",
         p.name
     );
     Ok(())
@@ -758,7 +893,7 @@ pub fn update() -> Result<()> {
         .into_iter()
         .filter(|n| service::is_installed(n))
     {
-        println!("Restart {n} to use the new version: cc-telegram service install {n}");
+        println!("Restart {n} to use the new version: cc-gateway service install {n}");
     }
     Ok(())
 }
@@ -783,7 +918,7 @@ pub fn uninstall() -> Result<()> {
     }
     let exe = std::env::current_exe()?;
     if exe.to_string_lossy().contains("/Cellar/") {
-        println!("Installed with Homebrew → run: brew uninstall cc-telegram");
+        println!("Installed with Homebrew → run: brew uninstall cc-gateway");
     } else {
         std::fs::remove_file(&exe)?;
         ok(format!("removed {}", exe.display()));
@@ -826,7 +961,7 @@ pub async fn doctor() -> Result<()> {
     check(
         !profiles.is_empty(),
         "at least one profile".into(),
-        "run: cc-telegram setup",
+        "run: cc-gateway setup",
     );
     let mut voice_wanted = false;
     for name in &profiles {
@@ -838,7 +973,7 @@ pub async fn doctor() -> Result<()> {
                 check(
                     false,
                     format!("{e:#}"),
-                    &format!("run: cc-telegram profile edit {name}"),
+                    &format!("run: cc-gateway profile edit {name}"),
                 );
                 continue;
             }
@@ -849,31 +984,55 @@ pub async fn doctor() -> Result<()> {
             format!("config.toml mode {mode:o}"),
             &format!("run: chmod 600 {}", p.config_path().display()),
         );
-        let me = get_me(&cfg.bot_token).await;
         check(
-            me.is_ok(),
-            match &me {
-                Ok(u) => format!("token valid (@{u})"),
-                Err(e) => format!("token rejected by Telegram ({e})"),
-            },
-            &format!("run: cc-telegram profile edit {name}"),
+            cfg.telegram_enabled() || cfg.api.enabled,
+            "a gateway is enabled (Telegram or API)".into(),
+            &format!("set bot_token or [api] enabled = true: cc-gateway profile edit {name}"),
         );
-        check(
-            !cfg.allowed_user_ids.is_empty(),
-            format!("allowlist has {} user(s)", cfg.allowed_user_ids.len()),
-            &format!("run: cc-telegram pair {name}"),
-        );
+        if cfg.telegram_enabled() {
+            let me = get_me(&cfg.bot_token).await;
+            check(
+                me.is_ok(),
+                match &me {
+                    Ok(u) => format!("Telegram token valid (@{u})"),
+                    Err(e) => format!("Telegram token rejected ({e})"),
+                },
+                &format!("run: cc-gateway profile edit {name}"),
+            );
+            check(
+                !cfg.allowed_user_ids.is_empty(),
+                format!("allowlist has {} user(s)", cfg.allowed_user_ids.len()),
+                &format!("run: cc-gateway pair {name}"),
+            );
+        }
+        if cfg.api.enabled {
+            let loopback = cfg
+                .api
+                .bind
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|a| a.ip().is_loopback());
+            check(
+                loopback,
+                format!("API bind {} is loopback-only", cfg.api.bind),
+                "use 127.0.0.1:<port> and a tunnel for remote access (see docs/security.md)",
+            );
+            check(
+                !cfg.api.keys.is_empty(),
+                format!("API has {} key(s)", cfg.api.keys.len()),
+                &format!("run: cc-gateway key create {name} <name>"),
+            );
+        }
         if cfg.claude_bin != "claude" {
             check(
                 claude_version(&cfg.claude_bin).is_some(),
                 format!("claude_bin {}", cfg.claude_bin),
-                &format!("fix claude_bin: cc-telegram profile edit {name}"),
+                &format!("fix claude_bin: cc-gateway profile edit {name}"),
             );
         }
         check(
             service::is_running(name),
             "service running".into(),
-            &format!("run: cc-telegram service install {name}"),
+            &format!("run: cc-gateway service install {name}"),
         );
         voice_wanted |= cfg.voice.enabled;
         if cfg.voice.enabled {

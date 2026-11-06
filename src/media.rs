@@ -91,7 +91,7 @@ pub async fn to_prompt(
         if !voice_ready(cfg) {
             bot.send_message(
                 msg.chat.id,
-                "🎤 Voice notes are disabled (needs ffmpeg + whisper-cli + model) → run: cc-telegram doctor",
+                "🎤 Voice notes are disabled (needs ffmpeg + whisper-cli + model) → run: cc-gateway doctor",
             )
             .await?;
             return Ok(None);

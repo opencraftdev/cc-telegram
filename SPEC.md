@@ -1,6 +1,8 @@
-# cc-telegram — Spec (v1)
+# cc-gateway — Spec (v1)
 
-A local, Hermes-style agent: a Telegram bot that forwards messages to **`claude -p`** (Claude Code headless) on your own machine and sends the answers back. One Rust binary, which is both the CLI and the bot daemon. Anyone can clone it and run it with their own bot token and their own Claude Code login.
+A local, Hermes-style agent gateway in front of **`claude -p`** (Claude Code headless) on your own machine. A profile runs one or more **gateways**: a **Telegram** bot and/or an **OpenAI-compatible HTTP API**. One Rust binary (`cc-gateway`), which is both the CLI and the daemon. Anyone can run it with their own Claude Code login. The backend is always the user's own Claude subscription through `claude -p`; there is **no Anthropic API key** anywhere.
+
+Repository: `github.com/opencraftdev/cc-gateways` (renamed from `cc-telegram`).
 
 ## Decisions (from grilling session, 2026-11-06)
 
@@ -20,6 +22,11 @@ A local, Hermes-style agent: a Telegram bot that forwards messages to **`claude 
 | 12 | Profiles | **Profile = full bot instance** (own token, allowlist, soul, memory, sessions, workspace), created via the CLI. |
 | 13 | Daemon | **`service install`**: launchd (macOS) / systemd user unit (Linux). |
 | 14 | Model | Profile default model + `/model` per chat, `--max-turns` + timeout, cost shown in `/status`. |
+| 15 | Name | **`cc-gateway`** (repo `cc-gateways`). Home `~/.cc-gateway`; an existing `~/.cc-telegram` is moved there once, with a notice; old paths in configs are rewritten and old `cc-telegram` services removed. |
+| 16 | Gateways | Telegram and API are gateways inside one profile; `cc-gateway run <profile>` starts whichever are enabled. Telegram is on when `bot_token` is set; API when `[api] enabled = true`. API-only profiles need no token. |
+| 17 | API | **axum**, OpenAI-compatible `/v1/chat/completions` + `/v1/models`, plus a native `/v1/runs` API. Loopback bind by default; non-loopback prints a loud warning. |
+| 18 | API auth | Bearer keys `ccg_…` created by `cc-gateway key create`; only sha256 + name + created_at are stored. Each key has its own memory namespace `users/key-<name>/`. |
+| 19 | API concurrency | Same per-conversation queues as Telegram; API runs are queued by session id (`session:<id>`), so one session never runs twice at once. Global `max_concurrent` cap → 429. Sessions belong to their creator (`sessions.json`): only the API key that created a session can resume it; Telegram sessions can't be resumed over the API. |
 
 > Why Rust: a single-binary distribution for others to use. It does **not** improve agent memory (that lives in markdown + Claude sessions) or meaningfully reduce RAM (each `claude` process is ~200–400MB of Node no matter what).
 
@@ -29,6 +36,8 @@ A local, Hermes-style agent: a Telegram bot that forwards messages to **`claude 
 - Messages from non-allowlisted users are dropped before any processing (no download, no spawn). Each drop is logged with user id and username.
 - The bot token sits in `config.toml` with file mode `0600`. It never appears in logs.
 - No secrets are passed in prompts. Claude inherits the env of the daemon, so keep that env lean.
+- **API keys are equivalent to a shell on this machine.** The API binds to `127.0.0.1` by default; binding elsewhere logs and prints a warning at startup. Remote use should go through an authenticated tunnel. Keys are stored only as sha256 hashes; compare is constant-time; revocation applies on the next request.
+- `image_url` parts must be `data:` URLs; remote URLs are rejected (no server-side fetching, no SSRF).
 - Per-user memory isolation protects against **accidental** leakage only. Claude runs with full file access, so any allowlisted user can ask it to read `config.toml` (the bot token), other users' `MEMORY.md`/`USER.md`, or anything else your OS user can read. It is not a boundary against a hostile allowlisted user.
 
 ## Installation (must be dead simple)
@@ -36,8 +45,8 @@ A local, Hermes-style agent: a Telegram bot that forwards messages to **`claude 
 Goal: **two commands from zero to chatting**, and nobody needs to know their Telegram user id.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/opencraftdev/cc-telegram/main/install.sh | sh
-cc-telegram setup
+curl -fsSL https://raw.githubusercontent.com/opencraftdev/cc-gateways/main/install.sh | sh
+cc-gateway setup
 ```
 
 ### Install channels
@@ -45,34 +54,34 @@ cc-telegram setup
 | Channel | Command | Notes |
 |---------|---------|-------|
 | Install script (primary) | `curl -fsSL .../install.sh \| sh` | Detects OS/arch, downloads a prebuilt binary from GitHub Releases, verifies its sha256, puts it in `~/.local/bin` (no sudo), and prints a PATH hint if needed |
-| Homebrew | `brew install opencraftdev/tap/cc-telegram` | Tap formula auto-updated on release |
-| Cargo | `cargo install cc-telegram` | For Rust users |
+| Homebrew | `brew install opencraftdev/tap/cc-gateway` | Tap formula auto-updated on release |
+| Cargo | `cargo install cc-gateway` | For Rust users |
 
 - Release binaries come from **cargo-dist** (GitHub Actions): macOS arm64/x64, Linux x64/arm64. cargo-dist also generates `install.sh` and the Homebrew formula, so we don't hand-maintain either.
-- `cc-telegram update`: self-update to the latest release (via `axoupdater`, which ships with cargo-dist).
-- `cc-telegram uninstall`: removes services and the binary. It asks before deleting `~/.cc-telegram`.
+- `cc-gateway update`: re-runs the install script for the latest release (instead of `axoupdater`; same result, no extra dependency).
+- `cc-gateway uninstall`: removes services and the binary. It asks before deleting `~/.cc-gateway`.
 
-### `cc-telegram setup` — the guided wizard
+### `cc-gateway setup` — the guided wizard
 
-Running `cc-telegram` with no args and no profiles also starts it. Each step checks first and fixes or explains:
+Running `cc-gateway` with no args and no profiles also starts it. Each step checks first and fixes or explains:
 
 1. **Check Claude Code.** `claude --version`. If missing: print `npm i -g @anthropic-ai/claude-code` (offer to run it). If not logged in: tell the user to run `claude` once to log in, then continue.
-2. **Bot token.** Show 3-line BotFather instructions (`/newbot` in @BotFather, copy the token). The user pastes the token, it's validated live via `getMe`, and the wizard shows `✅ Connected to @your_bot`. Bad tokens are re-asked, not crashed on.
+2. **Gateways.** `Enable Telegram? [Y/n]` and `Enable API server (OpenAI-compatible, on 127.0.0.1:8787)? [y/N]`; at least one. If Telegram: **bot token.** Show 3-line BotFather instructions (`/newbot` in @BotFather, copy the token). The user pastes the token, it's validated live via `getMe`, and the wizard shows `✅ Connected to @your_bot`. Bad tokens are re-asked, not crashed on.
 3. **Profile name.** Default `default`. Enter to accept.
-4. **Pair yourself (no user-id hunting).** The wizard says *"Open t.me/your_bot and press Start."* The bot temporarily accepts the **first** `/start` (2-minute window) and shows `Is this you? @username (Muhammad, id 123456789) [y/N]` (default No, so pressing Enter never allowlists a stranger). On an explicit yes, that id goes on the allowlist and the bot replies "Paired ✅".
+4. **Pair yourself (no user-id hunting)** (Telegram only; if the API is on, a key named `default` is created and printed once here). The wizard says *"Open t.me/your_bot and press Start."* The bot temporarily accepts the **first** `/start` (2-minute window) and shows `Is this you? @username (Muhammad, id 123456789) [y/N]` (default No, so pressing Enter never allowlists a stranger). On an explicit yes, that id goes on the allowlist and the bot replies "Paired ✅".
 5. **Model.** Pick `sonnet` / `opus` / `haiku` with arrow keys (default sonnet).
 6. **Voice (optional).** If `ffmpeg`/`whisper-cli` are missing: "Enable voice notes? Runs `brew install ffmpeg whisper-cpp` + downloads base model (~150MB) [y/N]". Skippable; the wizard shows a progress bar for the model download.
-7. **Run in background?** `[Y/n]`. Yes installs the launchd/systemd service and starts it. No prints `cc-telegram run default`.
+7. **Run in background?** `[Y/n]`. Yes installs the launchd/systemd service and starts it. No prints `cc-gateway run default`.
 8. **Done screen:** bot link, profile path, and the 4 most useful commands.
 
 Every prompt has a sane default, so pressing Enter all the way through works (except the pairing confirmation, which needs an explicit `y`). There's also a non-interactive mode for scripts:
-`cc-telegram setup --token $TOKEN --profile work --model sonnet --service --no-voice` (prints a pair code instead of the 2-min window).
+`cc-gateway setup --token $TOKEN --profile work --model sonnet --service --no-voice` (prints a pair code instead of the 2-min window). Add `--api` to also enable the API (creates key `default`); `--api` without `--token` makes an API-only profile.
 
 ### Hermes import
 
-If a [Hermes Agent](https://github.com/NousResearch/hermes-agent) install is found (`$HERMES_HOME`, else `~/.hermes`), `setup` offers to import it right after the Claude Code check: it lists what it found (counts and yes/no flags only, never secret values) and asks `Hermes Agent found at ~/.hermes. Import it? [Y/n]`. Hermes profiles (`~/.hermes/profiles/<name>/`, a dir with `config.yaml`, `.env`, `SOUL.md`, `profile.yaml`, `auth.json` or `state.db`) are offered too (multi-select); the root becomes `default` (or a name you pick), others keep their name. Non-interactive: `setup --import-hermes` / `--no-import-hermes` (`--token` overrides the root's token). Standalone: `cc-telegram import hermes [--profile <name>] [--hermes-home <path>] [--yes]`. Nothing in the Hermes home is written.
+If a [Hermes Agent](https://github.com/NousResearch/hermes-agent) install is found (`$HERMES_HOME`, else `~/.hermes`), `setup` offers to import it right after the Claude Code check: it lists what it found (counts and yes/no flags only, never secret values) and asks `Hermes Agent found at ~/.hermes. Import it? [Y/n]`. Hermes profiles (`~/.hermes/profiles/<name>/`, a dir with `config.yaml`, `.env`, `SOUL.md`, `profile.yaml`, `auth.json` or `state.db`) are offered too (multi-select); the root becomes `default` (or a name you pick), others keep their name. Non-interactive: `setup --import-hermes` / `--no-import-hermes` (`--token` overrides the root's token). Standalone: `cc-gateway import hermes [--profile <name>] [--hermes-home <path>] [--yes]`. Nothing in the Hermes home is written.
 
-| Hermes | cc-telegram |
+| Hermes | cc-gateway |
 |--------|-------------|
 | `.env` `TELEGRAM_BOT_TOKEN` | `bot_token` (validated with `getMe`; if invalid/missing: ask, or skip non-interactively) |
 | `.env` `TELEGRAM_ALLOWED_USERS` (comma-separated ids) | merged into `allowed_user_ids` |
@@ -81,40 +90,44 @@ If a [Hermes Agent](https://github.com/NousResearch/hermes-agent) install is fou
 | `config.yaml` `model.default` (or `model: <id>`) | `default_model` only if clearly Claude (→ `opus`/`sonnet`/`haiku`), else our default is kept and the summary says so |
 | `skills/**/<skill>/SKILL.md` (category folders, symlinks followed, `.hub` skipped) | copied to `workspace/.claude/skills/<skill>/` so `claude -p` picks them up |
 
-- Partial installs are fine: missing items are reported as skipped. Existing cc-telegram files with content are never overwritten without confirmation (`--yes` overrides). A summary table of imported/skipped items is printed per profile.
+- Partial installs are fine: missing items are reported as skipped. Existing cc-gateway files with content are never overwritten without confirmation (`--yes` overrides). A summary table of imported/skipped items is printed per profile.
 - **Token conflict:** two pollers on one token make Telegram answer `409 Conflict`. When the token came from Hermes the importer warns and suggests `hermes gateway stop` (`hermes -p <name> gateway stop` for a Hermes profile) or a new bot. At runtime a 409 from `getUpdates` is logged with the same hint.
 
 ### Adding other users later: pair codes
 
 ```
-cc-telegram pair <profile>        # prints: Send this to your bot within 10 min:  /pair 482913
+cc-gateway pair <profile>        # prints: Send this to your bot within 10 min:  /pair 482913
 ```
 The friend sends `/pair 482913` and is added to the allowlist. Codes are single-use, expire after 10 min, and 5 wrong attempts per user lock that user out. `allow <profile> <user_id>` still works for people who know their id.
 
 ### Friendly errors
 
-- Every error names **what failed + exact fix command**, e.g. `✗ claude not logged in → run: claude` or `✗ token rejected by Telegram → run: cc-telegram profile edit default`.
-- `cc-telegram doctor` re-runs all setup checks (claude, login, token, service running, ffmpeg, whisper, disk perms) as a ✅/✗ checklist.
+- Every error names **what failed + exact fix command**, e.g. `✗ claude not logged in → run: claude` or `✗ token rejected by Telegram → run: cc-gateway profile edit default`.
+- `cc-gateway doctor` re-runs all setup checks (claude, login, token, service running, ffmpeg, whisper, disk perms) as a ✅/✗ checklist.
 - Crates for the wizard: `dialoguer` (prompts/select), `indicatif` (progress), `console` (colors). The single binary stays ~10MB.
 
 ## Directory layout
 
 ```
-~/.cc-telegram/
+~/.cc-gateway/
 └── profiles/
     └── <profile>/
         ├── config.toml          # token, allowlist, model, limits (chmod 600)
         ├── SOUL.md              # shared personality for this bot
         ├── state.json           # chat_id -> { session_id, model }
-        ├── logs/bot.log
+        ├── sessions.json        # session_id -> owner (tg:<chat> | key:<name>)
+        ├── logs/bot.log         # gateway log (service.log: launchd stdout/stderr)
         ├── users/
-        │   └── <telegram_user_id>/
-        │       ├── MEMORY.md    # facts Claude learned (Claude-edited)
-        │       ├── USER.md      # who this user is (Claude-edited)
-        │       └── schedules.json
+        │   ├── <telegram_user_id>/
+        │   │   ├── MEMORY.md    # facts Claude learned (Claude-edited)
+        │   │   ├── USER.md      # who this user is (Claude-edited)
+        │   │   └── schedules.json
+        │   └── key-<api_key_name>/   # API key memory namespace (MEMORY.md, USER.md)
         └── workspace/           # cwd for every claude run in this profile
-            ├── inbox/<user_id>/   # downloaded photos/docs/voice transcripts
-            └── outbox/<chat_id>/  # files Claude wants sent back
+            ├── inbox/<user_id>/      # downloaded photos/docs/voice transcripts
+            ├── inbox/key-<name>/     # images sent to the API as data: URLs
+            ├── outbox/<chat_id>/     # files Claude wants sent back (Telegram)
+            └── .claude/skills/       # skills (e.g. imported from Hermes)
 ```
 
 One cwd per profile matters because Claude Code keys sessions by project dir. `--resume` only works when the cwd stays the same.
@@ -122,29 +135,34 @@ One cwd per profile matters because Claude Code keys sessions by project dir. `-
 ## CLI
 
 ```
-cc-telegram setup                      # guided wizard (see Installation); also runs on first launch
-cc-telegram pair <name>                # one-time code to add another user
-cc-telegram update | uninstall
-cc-telegram profile create <name>      # same as setup steps 2-7 for an extra profile
-cc-telegram profile list
-cc-telegram profile edit <name>        # opens config.toml in $EDITOR
-cc-telegram profile delete <name>      # confirms; deletes the dir
-cc-telegram allow <name> <user_id>     # add to allowlist
-cc-telegram deny  <name> <user_id>
-cc-telegram run <name>                 # foreground
-cc-telegram service install <name>     # launchd/systemd, auto-restart
-cc-telegram service uninstall <name>
-cc-telegram service status <name>
-cc-telegram doctor                     # checks claude, ffmpeg, whisper-cli, token validity
-cc-telegram import hermes [--profile <name>] [--hermes-home <path>] [--yes]   # import Hermes Agent
+cc-gateway setup                      # guided wizard (see Installation); also runs on first launch
+cc-gateway pair <name>                # one-time code to add another user
+cc-gateway update | uninstall
+cc-gateway profile create <name>      # same as setup steps 2-7 for an extra profile
+cc-gateway profile list
+cc-gateway profile edit <name>        # opens config.toml in $EDITOR
+cc-gateway profile delete <name>      # confirms; deletes the dir
+cc-gateway allow <name> <user_id>     # add to allowlist
+cc-gateway deny  <name> <user_id>
+cc-gateway run <name>                 # foreground; starts the enabled gateways
+cc-gateway key create <profile> <name>  # API key, printed once
+cc-gateway key list <profile>
+cc-gateway key revoke <profile> <name>
+cc-gateway service install <name>     # launchd/systemd, auto-restart
+cc-gateway service uninstall <name>
+cc-gateway service status <name>
+cc-gateway doctor                     # checks claude, ffmpeg, whisper-cli, token validity
+cc-gateway import hermes [--profile <name>] [--hermes-home <path>] [--yes]   # import Hermes Agent
 ```
+
+Service units: launchd label `dev.opencraft.cc-gateway.<profile>` (`~/Library/LaunchAgents`), systemd template `cc-gateway@.service` with one instance `cc-gateway@<profile>` per profile.
 
 `profile create` checks the token with `getMe`, writes a default `SOUL.md`, and prints the bot's @username. Tip shown to the user: send `/start` to the bot and copy your user id from the "not allowed" log line, or use @userinfobot.
 
 ### config.toml
 
 ```toml
-bot_token = "123456:ABC..."
+bot_token = "123456:ABC..."       # Telegram gateway on when set ("" = off)
 allowed_user_ids = [123456789]
 default_model = "sonnet"          # passed as --model
 max_turns = 30                    # --max-turns
@@ -153,11 +171,41 @@ claude_bin = "claude"             # path override
 extra_claude_args = []            # appended verbatim
 
 [voice]
-enabled = true                    # auto-false if deps missing
+enabled = false                   # setup turns it on when ffmpeg + whisper-cli + model exist
 whisper_bin = "whisper-cli"
-whisper_model = "~/.cc-telegram/models/ggml-base.bin"
+whisper_model = "~/.cc-gateway/models/ggml-base.bin"
 language = "auto"
+
+[api]
+enabled = false
+bind = "127.0.0.1:8787"           # non-loopback → startup warning
+max_concurrent = 4                # queued + running API requests; more → 429
+
+[[api.keys]]                      # written by `cc-gateway key create`
+name = "laptop"
+sha256 = "<hex sha256 of the key>"
+created_at = "2026-11-06T10:00:00+07:00"
 ```
+
+## API gateway
+
+Served by axum on `[api] bind`. Auth runs as middleware before any request body is read. Request bodies up to 20 MB. All errors (including 404 unknown endpoint, 405, 413) use the OpenAI shape `{"error": {"message", "type", "code": null}}`. The `Bearer` scheme is case-insensitive.
+
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `GET /health` | no | `{"ok": true, "version": "…"}` |
+| `GET /v1/models` | yes | `opus`, `sonnet`, `haiku` (+ the profile's `default_model` if it's a full id); any id `claude --model` accepts works |
+| `POST /v1/chat/completions` | yes | OpenAI chat completions, `stream` true or false |
+| `POST /v1/runs` | yes | Native: `{prompt, session_id?, model?, stream?}` |
+| `DELETE /v1/runs/{id}` | yes | Stop a run started by the same key (process-group kill) |
+
+- **Auth:** `Authorization: Bearer ccg_…` (43 base62 chars ≈ 256 bits). Missing/unknown/revoked → 401 `authentication_error`. Config is re-read per request, so `key create`/`revoke` apply without a restart.
+- **Chat mapping (stateless, OpenAI semantics):** `system`/`developer` messages are appended to the system prompt (after SOUL + the key's USER/MEMORY). One user message is sent as-is; a longer conversation is rendered as a transcript ending with "Reply to the last User message." Content parts: `text`, and `image_url` with a base64 `data:` URL (saved to `workspace/inbox/key-<name>/`, referenced by path); http(s) URLs → 400. Unknown parameters (temperature, …) are ignored.
+- **Sessions (optional):** request header `X-CC-Session: <id>` → `--resume <id>` and only the last user message is sent (only its images are saved). Responses of runs that started carry `X-CC-Session` (streaming included) and `X-CC-Run`. A session id not created by this key (unknown, another key's, or a Telegram chat's) → 404 `session_not_found`. Saved request images are deleted when the run ends.
+- **Responses:** non-stream: `chat.completion` with `usage {prompt_tokens, completion_tokens, total_tokens, total_cost_usd}` (tokens as reported by claude, else 0). Stream: SSE `chat.completion.chunk`s (first delta has `role`, text deltas as claude emits text blocks, last chunk has `finish_reason: "stop"` + `usage`), then `data: [DONE]`. A failure mid-stream is sent as `data: {"error": …}` before `[DONE]`.
+- **Native runs:** non-stream → `{run_id, text, session_id, cost_usd, duration_ms, is_error}`. Stream → SSE events `init {run_id, session_id}`, `tool {name, input}`, `text {text}`, `result {…same as JSON}`, `error {type, message}`.
+- **Status codes:** 400 invalid request, 401 auth, 404 unknown session/run, 409 stopped, 413 body too large, 429 over `max_concurrent`, 500 claude failed to run, 502 claude returned an error, 504 timeout (`run_timeout_secs`).
+- **Concurrency:** queue key `session:<id>` (same session serialized); requests without a session get their own queue (parallel). Global semaphore `max_concurrent` covers queued + running requests and is taken before anything is written to disk. A client that disconnects stops its run.
 
 ## Core flow (one message)
 
@@ -235,16 +283,19 @@ language = "auto"
 
 ## Rust crates
 
-`tokio` (full), `teloxide` (macros), `serde`/`serde_json`, `toml`, `clap` (derive), `cron`, `chrono`, `tracing` + `tracing-appender`, `anyhow`, `dirs`. Nothing else unless a need shows up.
+`tokio` (full), `teloxide` (macros), `serde`/`serde_json`, `toml`, `clap` (derive), `cron`, `chrono`, `tracing` + `tracing-appender`, `anyhow`, `dirs`; for the API: `axum`, `sha2`, `tokio-stream` (SSE body). Nothing else unless a need shows up.
 
 Module sketch:
 ```
 src/main.rs        # clap CLI dispatch
 src/profile.rs     # create/list/edit/delete, config load/save
-src/bot.rs         # teloxide dispatcher, allowlist filter, commands
+src/bot.rs         # Telegram gateway: teloxide dispatcher, allowlist filter, commands
+src/api.rs         # API gateway: axum routes, keys, OpenAI mapping, SSE
+src/hermes.rs      # Hermes Agent import
+src/setup.rs       # wizard, doctor, keys, pair, update/uninstall
 src/media.rs       # downloads, ffmpeg + whisper
 src/runner.rs      # spawn claude, parse stream-json, timeout, kill
-src/queue.rs       # per-chat workers, /stop handles
+src/queue.rs       # per-conversation workers (tg:<chat>, session:<id>), stop handles
 src/prompt.rs      # system prompt assembly from SOUL/USER/MEMORY
 src/schedule.rs    # cron loop
 src/service.rs     # launchd plist / systemd unit
@@ -253,9 +304,9 @@ src/state.rs       # state.json atomic persistence
 
 ## Acceptance criteria (v1)
 
-- [ ] On a fresh Mac with Claude Code logged in: `install.sh` + `cc-telegram setup` pressing only Enter + Telegram Start leads to a working bot in under 3 minutes
+- [ ] On a fresh Mac with Claude Code logged in: `install.sh` + `cc-gateway setup` pressing only Enter + Telegram Start leads to a working bot in under 3 minutes
 - [ ] Setup never asks the user to type their Telegram user id
-- [ ] A friend is added via `cc-telegram pair` + `/pair <code>` with no config editing
+- [ ] A friend is added via `cc-gateway pair` + `/pair <code>` with no config editing
 - [ ] Every setup failure prints the exact fix command
 
 - [ ] `profile create` → `run` → a message from an allowlisted user gets a Claude reply in Telegram
@@ -273,11 +324,17 @@ src/state.rs       # state.json atomic persistence
 - [ ] A partial Hermes install (e.g. only `config.yaml` + `skills/`) imports what exists and reports the rest as skipped
 - [ ] Re-running the import never overwrites edited files without confirmation (or `--yes`)
 - [ ] When the Hermes gateway still polls the same token, the bot logs the 409 hint instead of failing silently
+- [ ] An existing `~/.cc-telegram` is moved to `~/.cc-gateway` on first run, with a one-line notice; old paths in configs are rewritten and old cc-telegram launchd/systemd services are removed
+- [ ] An API-only profile (`setup --api`, no token) runs `cc-gateway run <profile>` without Telegram
+- [ ] The OpenAI Python/JS SDKs work against `http://127.0.0.1:8787/v1` with a `ccg_` key, streaming and non-streaming
+- [ ] Missing/bad/revoked keys get 401 in OpenAI error shape; over `max_concurrent` gets 429
+- [ ] `X-CC-Session` continues a conversation; every response returns the session id
+- [ ] `DELETE /v1/runs/{id}` stops a running native run; binding to a non-loopback address prints a warning
 
 ## Out of scope (v1)
 
 - Group chats / @mention mode
 - Spend budgets (just display the cost)
 - Remote/cloud hosting, webhooks (long polling only)
-- Multiple workspaces per profile (`/cd`). Possible v2: `cc-telegram workspace add`
+- Multiple workspaces per profile (`/cd`). Possible v2: `cc-gateway workspace add`
 - Windows service support
