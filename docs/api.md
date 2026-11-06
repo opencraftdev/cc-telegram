@@ -33,7 +33,7 @@ cc-gateway key revoke <profile> <name>
 - Keys look like `ccg_` followed by 43 base62 characters. Only the sha256 hash, the name and the creation time are stored in `config.toml` (mode 0600).
 - Send the key as `Authorization: Bearer ccg_…` (the scheme is case-insensitive). The key is checked before the request body is read.
 - The server re-reads keys on every request, so creating or revoking a key works without a restart.
-- Each key has its own memory namespace, `users/key-<name>/` (MEMORY.md and USER.md). All keys share the profile's `SOUL.md`. Key names use letters, digits, `-` and `_`.
+- Each key has its own notes, `users/key-<name>/` (MEMORY.md and USER.md). All keys and Telegram users share the profile's `SOUL.md` and its shared `MEMORY.md` / `USER.md`. Key names use letters, digits, `-` and `_`.
 
 ## Endpoints
 
@@ -110,7 +110,7 @@ for await (const chunk of stream) process.stdout.write(chunk.choices[0]?.delta?.
 
 ### How requests are mapped
 
-- `system` and `developer` messages are appended to the system prompt, after SOUL.md and the key's USER.md and MEMORY.md.
+- `system` and `developer` messages are appended to the system prompt, after SOUL.md, the shared memory and the key's own notes.
 - **Stateless by default**, as in the OpenAI API. A single user message is sent as-is. A longer conversation is rendered into the prompt as a transcript (`User: … / Assistant: …`) ending with "Reply to the last User message."
 - Supported content parts: `text`, and `image_url` with a base64 `data:` URL (`data:image/png;base64,…`, strict base64). Images are saved to `workspace/inbox/key-<name>/`, referenced by path, and deleted when the run ends. With `X-CC-Session`, only images in the last user message are used. `http(s)://` image URLs are rejected with 400; the server never fetches remote URLs.
 - Parameters such as `temperature`, `max_tokens` and `tools` are ignored, not rejected.

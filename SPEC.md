@@ -10,7 +10,7 @@ Repository: `github.com/opencraftdev/cc-gateways` (renamed from `cc-telegram`).
 |---|-------|----------|
 | 1 | Access | **Allowlist** of Telegram user IDs per profile. Everyone else is ignored silently. |
 | 2 | Conversation | **Per-chat session**: store `session_id`, pass `--resume <id>`. `/new` resets it. |
-| 3 | Personality / memory | **Shared `SOUL.md`** per profile + **per-user `MEMORY.md` + `USER.md`**. |
+| 3 | Personality / memory | **Shared `SOUL.md`** + **profile-wide `MEMORY.md` + `USER.md`** (Hermes semantics: shared by everyone using the bot) + **per-person notes** `users/<id>/USER.md` + `MEMORY.md`. |
 | 4 | Memory writes | **Claude edits its own memory files** (instructed via system prompt, ~2k char cap each). |
 | 5 | Tools | **Full agent** with `--dangerously-skip-permissions`, cwd = profile workspace. |
 | 6 | Stack | **Rust**: `tokio` + `teloxide` + `serde_json` + `clap`. |
@@ -30,6 +30,10 @@ Repository: `github.com/opencraftdev/cc-gateways` (renamed from `cc-telegram`).
 | 20 | Hermes server import | Allowlist derived like Hermes' authz (`gateway/authz_mixin.py`): `TELEGRAM_ALLOWED_USERS` ∪ `GATEWAY_ALLOWED_USERS` ∪ approved pairings ∪ the home-channel owner. Hermes allow-all is **not** imported (owner only, with a warning). Discord-only profiles are skipped. |
 | 21 | Cron import | Hermes `cron/jobs.json` → our schedules: agent jobs → prompt jobs, `no_agent` script jobs → **command jobs** (argv, no shell, no claude). `enabled`, interval schedules and silent (`deliver = false`) jobs are supported. |
 | 22 | RAM | Process-wide cap `max_concurrent_runs` (default 2) on concurrent claude processes, shared by Telegram, API and cron; waiting jobs queue (Telegram shows `⏳ queued (n ahead)`). |
+| 24 | Prompt parity with Hermes | SOUL.md is the identity slot and explicitly overrides Claude Code's default persona (kept appended, not replaced: verified with claude 2.1.x). Memory rendered like Hermes (`§`-delimited entries, `[pct — n/limit chars]` headers, limits 2200/1375), Telegram platform hint with the sender's name, first `.hermes.md`/`HERMES.md`/`AGENTS.md` in the working dir, current date + UTC offset. |
+| 25 | History import | Hermes `state.db` (read-only, immutable) → last 30 user/assistant messages per allowlisted Telegram chat in `users/<chat>/HISTORY.md`, injected only until that chat's first session is stored. |
+| 26 | Working dir | Optional `workdir` (imported from Hermes `terminal.cwd` / `TERMINAL_CWD` when absolute): claude's cwd; the workspace is then passed with `--add-dir`, which keeps its skills loaded. |
+| 27 | Flaky networks | getMe errors are classified: only HTTP 401/404 = "token rejected"; anything else = "can't reach Telegram (network)", retried (CLI: 8×, 1s→16s; bot startup: forever, cap 5 min). api.telegram.org also resolves to Telegram's seed IPs after the DNS answer. A typing indicator runs from message acceptance to the last file sent (4s, 3s-capped requests). |
 | 23 | Multi-profile | `cc-gateway run --all` runs every profile in one process; `service install --all` installs one unit for it and refuses if per-profile units exist (double polling → 409). |
 
 > Why Rust: a single-binary distribution for others to use. It does **not** improve agent memory (that lives in markdown + Claude sessions) or meaningfully reduce RAM (each `claude` process is ~200–400MB of Node no matter what).
@@ -89,11 +93,13 @@ If a [Hermes Agent](https://github.com/NousResearch/hermes-agent) install is fou
 |--------|-------------|
 | `.env` `TELEGRAM_BOT_TOKEN` | `bot_token` (validated with `getMe`; if invalid/missing: ask, or skip non-interactively) |
 | `.env` `TELEGRAM_ALLOWED_USERS`, `GATEWAY_ALLOWED_USERS` (comma-separated ids), approved pairings (`pairing/telegram-approved.json` if that legacy dir has content, else `platforms/pairing/telegram-approved.json`), plus the owner | merged into `allowed_user_ids`. If Hermes allows everyone (`TELEGRAM_ALLOW_ALL_USERS` / `GATEWAY_ALLOW_ALL_USERS` true, or `*` in a list) only the owner is imported, with a warning |
-| owner: `config.yaml` `platforms.telegram.home_channel.user_id`, else a private (positive) `TELEGRAM_HOME_CHANNEL`, else the single allowed user | default memory owner and owner of imported cron jobs |
+| owner: `config.yaml` `platforms.telegram.home_channel.user_id`, else a private (positive) `TELEGRAM_HOME_CHANNEL`, else the single allowed user | owner of imported cron jobs (memory is shared, see below) |
 | home chat: `home_channel.chat_id`, else `TELEGRAM_HOME_CHANNEL`, else the owner's DM | `chat_id` of imported cron jobs |
 | `cron/jobs.json` | owner's `schedules.json` (see Scheduling); `scripts/` → `workspace/scripts/` when script jobs are imported |
 | `SOUL.md` | `SOUL.md` |
-| `memories/MEMORY.md`, `memories/USER.md` (single owner) | `users/<owner>/`; without an owner: the one allowed id; if several, you pick (non-interactive: first, with a note); if none, `imported/` and moved to the first user who pairs |
+| `memories/MEMORY.md`, `memories/USER.md` (profile-wide in Hermes) | `<profile>/MEMORY.md`, `<profile>/USER.md` (shared memory, injected for every user) |
+| `state.db` (sessions + messages, opened read-only/immutable) | `users/<chat_id>/HISTORY.md`: last 30 user/assistant text messages of each allowlisted Telegram chat (DMs of allowed users, the home chat), long ones trimmed |
+| `terminal.cwd` / `TERMINAL_CWD` (absolute, existing) | `workdir` |
 | `config.yaml` `model.default` (or `model: <id>`) | `default_model` only if clearly Claude (→ `opus`/`sonnet`/`haiku`), else our default is kept and the summary says so |
 | `skills/**/<skill>/SKILL.md` (category folders, symlinks followed, `.hub` skipped) | copied **flat** to `workspace/.claude/skills/<skill>/` (Claude Code only discovers `.claude/skills/<name>/SKILL.md`, not nested category folders; verified with claude 2.1.x) |
 
@@ -122,16 +128,19 @@ The friend sends `/pair 482913` and is added to the allowlist. Codes are single-
     └── <profile>/
         ├── config.toml          # token, allowlist, model, limits (chmod 600)
         ├── SOUL.md              # shared personality for this bot
-        ├── state.json           # chat_id -> { session_id, model }
+        ├── MEMORY.md            # shared memory: work, owner, environment (Claude-edited, 2200 chars)
+        ├── USER.md              # shared profile of the owner/user (Claude-edited, 1375 chars)
+        ├── state.json           # chat_id -> { session_id, model, … }
         ├── sessions.json        # session_id -> owner (tg:<chat> | key:<name>)
         ├── logs/bot.log         # gateway log (service.log: launchd stdout/stderr)
         ├── users/
         │   ├── <telegram_user_id>/
-        │   │   ├── MEMORY.md    # facts Claude learned (Claude-edited)
-        │   │   ├── USER.md      # who this user is (Claude-edited)
+        │   │   ├── MEMORY.md    # notes about this person (Claude-edited)
+        │   │   ├── USER.md      # this person's preferences (Claude-edited)
+        │   │   ├── HISTORY.md   # imported chat history (chat id = user id for DMs)
         │   │   └── schedules.json
         │   └── key-<api_key_name>/   # API key memory namespace (MEMORY.md, USER.md)
-        └── workspace/           # cwd for every claude run in this profile
+        └── workspace/           # cwd for every claude run (unless `workdir` is set)
             ├── inbox/<user_id>/      # downloaded photos/docs/voice transcripts
             ├── inbox/key-<name>/     # images sent to the API as data: URLs
             ├── outbox/<chat_id>/     # files Claude wants sent back (Telegram)
@@ -228,23 +237,22 @@ Served by axum on `[api] bind`. Auth runs as middleware before any request body 
    - document: download to `inbox/<uid>/<filename>`, prompt = caption + `[Attached file: <abs path>]`
    - voice: download `.oga`, `ffmpeg -i in.oga -ar 16000 -ac 1 out.wav`, `whisper-cli -m <model> -f out.wav -otxt`, prompt = `[Voice transcript]: <text>`. Reply with the transcript first so the user can see what was heard.
 3. **Enqueue** on the chat's queue (`HashMap<ChatId, mpsc::Sender<Job>>`, one worker task per chat).
-4. **Build the system prompt** fresh on every run (so memory edits apply next turn):
+4. **Build the system prompt** fresh on every run (so memory edits apply next turn), appended to Claude Code's own prompt (`--append-system-prompt`), in Hermes' order:
    ```
+   # Identity            — "SOUL.md defines who you are … overrides any default assistant identity"
    <SOUL.md>
-
-   ## About this user (USER.md — path: <abs>)
-   <USER.md>
-
-   ## Your memory of this user (MEMORY.md — path: <abs>)
-   <MEMORY.md>
-
-   ## Memory rules
-   - When you learn something durable about the user or their preferences, Edit USER.md / MEMORY.md at the paths above.
-   - Keep each file under 2000 characters; prune or merge old entries instead of appending forever.
-   - Never store secrets (passwords, tokens, keys).
-   - To send a file back, write it into <abs outbox/chat_id>/.
-   - You are replying in Telegram: be concise, use plain Markdown.
+   # Platform            — Telegram hint + "talking with <Full Name> (@username)" + outbox path
+   # Project context     — first of .hermes.md / HERMES.md / AGENTS.md in the working dir (20k cap)
+   # Memory              — Hermes' memory guidance: shared vs per-person, declarative facts,
+                           `§` entry format, prune to the limits, no secrets
+   ══ MEMORY (shared notes for this bot) [pct — n/2200 chars] — file: <profile>/MEMORY.md
+   ══ USER PROFILE (who the user/owner is) [pct — n/1375 chars] — file: <profile>/USER.md
+   ══ THIS PERSON (who is writing now) [… /1375] — file: users/<id>/USER.md
+   ══ NOTES ABOUT THIS PERSON [… /1375] — file: users/<id>/MEMORY.md
+   # Earlier conversation — users/<chat>/HISTORY.md, only until the chat's first session exists
+   Current date: Friday, November 06, 2026 14:03 (timezone UTC+07:00)
    ```
+   Verified: with a SOUL like "You are Budi, reply only in Indonesian, sign every message with — Budi", `who are you?` is answered as Budi, in Indonesian, signed.
 5. **Spawn**:
    ```
    claude -p "<prompt>" \
@@ -260,7 +268,7 @@ Served by axum on `[api] bind`. Auth runs as middleware before any request body 
    - `system/init`: capture `session_id`
    - `assistant` with `tool_use` blocks: append `🔧 <tool>: <short input>` to the status message. Edit at most once every 1.5s (Telegram rate limit) and keep the last ~10 lines.
    - `result`: final `result` text, `session_id`, `total_cost_usd`, `is_error`
-   - Send a `typing` chat action every 4s while running.
+   - A `typing` chat action every 4s from message acceptance through queueing, the run and the reply (upload actions while sending outbox files).
 7. **Reply**: send the final text as a new message (split at 4096 chars, try MarkdownV2 and fall back to plain text on a parse error). Delete the status message or collapse it to `✅ done · $0.04 · 12s`.
 8. **Outbox**: send every file in `outbox/<chat_id>/` (photos as photo, others as document), then delete them.
 9. **Persist** `session_id` → `state.json` (atomic write: temp file + rename).
@@ -280,8 +288,8 @@ Served by axum on `[api] bind`. Auth runs as middleware before any request body 
 | `/stop` | Kill the running claude process for this chat and clear the queue |
 | `/status` | Model, session id (short), queue length, running time, last run cost |
 | `/model <opus\|sonnet\|haiku\|full-id>` | Set the model for this chat |
-| `/memory` | Show this user's MEMORY.md + USER.md |
-| `/forget` | Wipe this user's MEMORY.md + USER.md (asks for confirmation via inline button) |
+| `/memory` | Show the shared MEMORY.md + USER.md and this user's own notes |
+| `/forget` | Wipe this user's own MEMORY.md + USER.md (shared memory stays; asks for confirmation via inline button) |
 | `/schedule <m h dom mon dow> <prompt>` | Add a cron job |
 | `/schedules` | List jobs with ids |
 | `/unschedule <id>` | Remove a job |
@@ -296,7 +304,7 @@ Served by axum on `[api] bind`. Auth runs as middleware before any request body 
 
 ## Rust crates
 
-`tokio` (full), `teloxide` (macros), `serde`/`serde_json`, `toml`, `clap` (derive), `cron`, `chrono`, `tracing` + `tracing-appender`, `anyhow`, `dirs`; for the API: `axum`, `sha2`, `tokio-stream` (SSE body). Nothing else unless a need shows up.
+`tokio` (full), `teloxide` (macros), `serde`/`serde_json`, `toml`, `clap` (derive), `cron`, `chrono`, `tracing` + `tracing-appender`, `anyhow`, `dirs`; for the API: `axum`, `sha2`, `tokio-stream` (SSE body); for the Hermes history import: `rusqlite` (`bundled`, cross-compiles with cargo-zigbuild). Nothing else unless a need shows up.
 
 Module sketch:
 ```
@@ -346,6 +354,7 @@ src/state.rs       # state.json atomic persistence
 - [ ] Importing a real Hermes server profile allowlists approved pairings + the home-channel owner without a `TELEGRAM_ALLOWED_USERS`; allow-all imports the owner only; Discord-only profiles are skipped with a clear line
 - [ ] Hermes cron jobs arrive as schedules (script jobs as command jobs with their scripts copied; paused ones disabled); re-importing doesn't duplicate them
 - [ ] With `max_concurrent_runs = 2`, a third message waits and shows `⏳ queued (n ahead)`
+- [ ] An imported Hermes profile answers as its SOUL, knows the shared Hermes memory for every user, and the first chat after the move continues from the imported history
 - [ ] `run --all` serves every profile in one process; one profile's 409 or bad token doesn't stop the others; `service install --all` refuses while per-profile units exist
 
 ## Out of scope (v1)

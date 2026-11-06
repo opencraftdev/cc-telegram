@@ -88,9 +88,9 @@ fn claude_logged_in(bin: &str) -> Option<bool> {
     v["loggedIn"].as_bool()
 }
 
-async fn get_me(token: &str) -> Result<String> {
-    let me = Bot::new(token).get_me().await?;
-    Ok(me.username().to_string())
+/// getMe with network retries (~1 min); tells a rejected token from an unreachable Telegram.
+async fn get_me(token: &str) -> std::result::Result<String, crate::bot::MeError> {
+    crate::bot::get_me_cli(token).await
 }
 
 fn voice_deps(cfg: &Config) -> (bool, bool, bool) {
@@ -178,8 +178,11 @@ async fn ask_token() -> Result<(String, String)> {
         let t = t.trim().to_string();
         match get_me(&t).await {
             Ok(u) => break (t, u),
+            Err(e @ crate::bot::MeError::Rejected(_)) => {
+                bad(format!("{e} → paste the token from @BotFather again"))
+            }
             Err(e) => bad(format!(
-                "token rejected by Telegram ({e}) → paste the token from @BotFather again"
+                "{e} → check the connection, then paste the token again"
             )),
         }
     };
@@ -253,7 +256,7 @@ async fn finish_profile(p: &Profile, mut cfg: Config, bot_name: Option<&str>) ->
             "  Open {} and press Start (waiting 2 minutes)…",
             style(format!("https://t.me/{bot_name}")).underlined()
         );
-        if !pair_window(&Bot::new(&cfg.bot_token), &mut cfg, p).await? {
+        if !pair_window(&crate::bot::telegram_bot(&cfg.bot_token).await, &mut cfg, p).await? {
             bad("no /start confirmed in time; pair later with the code below");
             print_pair_code(p)?;
         }
@@ -503,10 +506,13 @@ async fn non_interactive(a: SetupArgs) -> Result<()> {
     let bot_name = if token.is_empty() {
         None // API-only
     } else {
-        let b = get_me(&token).await.map_err(|e| {
-            anyhow::anyhow!(
-                "✗ token rejected by Telegram ({e}) → get a valid token from @BotFather"
-            )
+        let b = get_me(&token).await.map_err(|e| match e {
+            crate::bot::MeError::Rejected(_) => {
+                anyhow::anyhow!("{e} → get a valid token from @BotFather")
+            }
+            crate::bot::MeError::Network(_) => {
+                anyhow::anyhow!("{e} → check the connection and run setup again")
+            }
         })?;
         ok(format!("Connected to @{b}"));
         Some(b)
@@ -724,10 +730,19 @@ pub async fn import_hermes(
         };
         let from_hermes = candidate.is_some() && candidate == f.token;
         let mut token = None;
+        let mut unverified = false;
         if let Some(t) = candidate {
             match get_me(&t).await {
                 Ok(u) => token = Some((t, u)),
-                Err(e) => bad(format!("imported bot token rejected by Telegram ({e})")),
+                Err(e @ crate::bot::MeError::Rejected(_)) => bad(format!("imported bot {e}")),
+                // Flaky network ≠ bad token: keep it, the bot retries at startup.
+                Err(e) => {
+                    bad(format!(
+                        "{e}; importing the Hermes token anyway (not verified)"
+                    ));
+                    unverified = true;
+                    token = Some((t, "(not verified — network)".to_string()));
+                }
             }
         }
         let p = if existing {
@@ -787,7 +802,14 @@ pub async fn import_hermes(
                         .interact()?);
             if replace {
                 cfg.bot_token = token.clone();
-                rows.push(("bot token".into(), "imported".into()));
+                rows.push((
+                    "bot token".into(),
+                    if unverified {
+                        "imported (not verified — network)".into()
+                    } else {
+                        "imported".into()
+                    },
+                ));
             } else {
                 rows.push(("bot token".into(), "kept existing".into()));
             }
@@ -838,6 +860,15 @@ pub async fn import_hermes(
                 None => "none in Hermes".into(),
             },
         ));
+        if let Some(w) = &f.workdir
+            && cfg.workdir.is_none()
+        {
+            cfg.workdir = Some(w.to_string_lossy().into_owned());
+            rows.push((
+                "workdir".into(),
+                format!("{} (Hermes terminal.cwd)", w.display()),
+            ));
+        }
         let p = match p {
             Some(p) => {
                 let _lock = p.lock()?;
@@ -847,28 +878,8 @@ pub async fn import_hermes(
             None => Profile::create(&name, &cfg)?,
         };
 
-        // Hermes memory has one owner: the home channel's user, else the single allowed user.
-        let owner = match f.allowed.as_slice() {
-            _ if f.owner.is_some() => f.owner,
-            [] => None,
-            [one] => Some(*one),
-            many if ask => {
-                let labels: Vec<_> = many.iter().map(u64::to_string).collect();
-                let i = Select::new()
-                    .with_prompt("Hermes memory belongs to one user. Which Telegram id is it?")
-                    .items(&labels)
-                    .default(0)
-                    .interact()?;
-                Some(many[i])
-            }
-            many => {
-                println!(
-                    "  note: several allowed users; Hermes memory assigned to the first ({})",
-                    many[0]
-                );
-                Some(many[0])
-            }
-        };
+        // Cron jobs belong to the owner (home-channel user), else the first allowed user.
+        let owner = f.owner.or(f.allowed.first().copied());
         let mut confirm = |dst: &std::path::Path| {
             yes || (ask
                 && Confirm::new()
@@ -877,14 +888,14 @@ pub async fn import_hermes(
                     .interact()
                     .unwrap_or(false))
         };
-        rows.extend(hermes::import_files(f, &p, owner, &mut confirm));
+        rows.extend(hermes::import_files(f, &p, &mut confirm));
         rows.extend(hermes::import_jobs(f, &p, owner, &mut confirm));
-        if owner.is_none() && (f.memory.is_some() || f.user.is_some()) {
-            rows.push((
-                "memory owner".into(),
-                "assigned on first successful pair".into(),
-            ));
-        }
+        rows.extend(hermes::import_history(
+            f,
+            &p,
+            &cfg.allowed_user_ids,
+            &mut confirm,
+        ));
         for (item, result) in &rows {
             println!("  {item:<24} {result}");
         }
@@ -1085,13 +1096,19 @@ pub async fn doctor() -> Result<()> {
         );
         if cfg.telegram_enabled() {
             let me = get_me(&cfg.bot_token).await;
+            let fix = match &me {
+                Err(crate::bot::MeError::Network(_)) => {
+                    "check this machine's connection to api.telegram.org".to_string()
+                }
+                _ => format!("run: cc-gateway profile edit {name}"),
+            };
             check(
                 me.is_ok(),
                 match &me {
                     Ok(u) => format!("Telegram token valid (@{u})"),
-                    Err(e) => format!("Telegram token rejected ({e})"),
+                    Err(e) => e.to_string().trim_start_matches("✗ ").to_string(),
                 },
-                &format!("run: cc-gateway profile edit {name}"),
+                &fix,
             );
             check(
                 !cfg.allowed_user_ids.is_empty(),

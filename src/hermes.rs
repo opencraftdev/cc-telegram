@@ -80,7 +80,7 @@ pub struct Found {
     /// Hermes was configured to allow every Telegram user (not imported).
     pub allow_all: bool,
     /// `platforms.telegram.home_channel.user_id`, else a private TELEGRAM_HOME_CHANNEL, else the
-    /// single allowed user. Default memory owner.
+    /// single allowed user. Owns imported cron jobs.
     pub owner: Option<u64>,
     /// Where cron output goes: home_channel.chat_id / TELEGRAM_HOME_CHANNEL / owner's DM.
     pub home_chat: Option<i64>,
@@ -98,6 +98,10 @@ pub struct Found {
     pub jobs: Vec<HermesJob>,
     /// `<home>/scripts`, where Hermes resolves cron `script` paths.
     pub scripts: Option<PathBuf>,
+    /// `<home>/state.db` (conversation history).
+    pub state_db: Option<PathBuf>,
+    /// Hermes' working dir for the agent (`terminal.cwd` / `TERMINAL_CWD`), if absolute and present.
+    pub workdir: Option<PathBuf>,
 }
 
 /// A Hermes cron job (`cron/jobs.json`), already mapped to what we can run.
@@ -228,6 +232,12 @@ pub fn scan(dir: &Path) -> Found {
             .map(|s| parse_jobs(&s))
             .unwrap_or_default(),
         scripts: scripts.is_dir().then_some(scripts),
+        state_db: file(dir.join("state.db")),
+        workdir: get("TERMINAL_CWD")
+            .cloned()
+            .or_else(|| yaml_get(&yaml, &["terminal", "cwd"]))
+            .map(|w| crate::profile::expand_tilde(&w))
+            .filter(|w| w.is_absolute() && w.is_dir()),
     }
 }
 
@@ -554,15 +564,9 @@ fn replaceable(p: &Path) -> bool {
 
 pub type Row = (String, String);
 
-/// Copy SOUL.md, memories and skills into `p`. Memory goes to `users/<owner>/`, or to
-/// `imported/` (claimed on first pair) when there's no owner yet. `confirm` is asked before
-/// overwriting anything that already has content.
-pub fn import_files(
-    f: &Found,
-    p: &Profile,
-    owner: Option<u64>,
-    confirm: &mut dyn FnMut(&Path) -> bool,
-) -> Vec<Row> {
+/// Copy SOUL.md, the profile-wide memories (to `<profile>/MEMORY.md`, `USER.md`) and skills
+/// into `p`. `confirm` is asked before overwriting anything that already has content.
+pub fn import_files(f: &Found, p: &Profile, confirm: &mut dyn FnMut(&Path) -> bool) -> Vec<Row> {
     let mut rows = vec![];
     let mut put = |item: &str, src: &Option<PathBuf>, dst: PathBuf, rows: &mut Vec<Row>| {
         let Some(src) = src else {
@@ -586,9 +590,9 @@ pub fn import_files(
         ));
     };
     put("SOUL.md", &f.soul, p.soul_path(), &mut rows);
-    let mem_dir = owner.map_or_else(|| p.imported_dir(), |u| p.user_dir(u));
-    put("MEMORY.md", &f.memory, mem_dir.join("MEMORY.md"), &mut rows);
-    put("USER.md", &f.user, mem_dir.join("USER.md"), &mut rows);
+    // Hermes memory is profile-wide (every user of the bot sees it): shared files.
+    put("MEMORY.md", &f.memory, p.dir.join("MEMORY.md"), &mut rows);
+    put("USER.md", &f.user, p.dir.join("USER.md"), &mut rows);
 
     let skills_dir = p.workspace().join(".claude/skills");
     let mut used = std::collections::HashSet::new();
@@ -717,6 +721,139 @@ pub fn import_jobs(
     rows
 }
 
+/// One message from Hermes' history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Msg {
+    pub user: bool,
+    pub text: String,
+    pub at: f64,
+}
+
+/// The last `per_chat` user/assistant text messages of every Telegram chat in Hermes'
+/// `state.db`, oldest first. Opened read-only + immutable: the database is never written,
+/// even while Hermes runs.
+pub fn read_history(db: &Path, per_chat: usize) -> Result<HashMap<i64, Vec<Msg>>, String> {
+    use rusqlite::{Connection, OpenFlags};
+    let uri = format!("file:{}?mode=ro&immutable=1", db.display());
+    let con = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut q = con
+        .prepare(
+            "SELECT s.chat_id, m.role, m.content, m.timestamp FROM messages m \
+             JOIN sessions s ON s.id = m.session_id \
+             WHERE s.source = 'telegram' AND m.role IN ('user', 'assistant') \
+             AND m.content IS NOT NULL AND trim(m.content) != '' \
+             ORDER BY m.timestamp, m.id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = q
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out: HashMap<i64, Vec<Msg>> = HashMap::new();
+    for row in rows.flatten() {
+        let (Some(chat), role, text, at) = row else {
+            continue;
+        };
+        let Ok(chat) = chat.trim().parse::<i64>() else {
+            continue;
+        };
+        out.entry(chat).or_default().push(Msg {
+            user: role == "user",
+            text,
+            at,
+        });
+    }
+    for msgs in out.values_mut() {
+        let skip = msgs.len().saturating_sub(per_chat);
+        msgs.drain(..skip);
+    }
+    Ok(out)
+}
+
+/// HISTORY.md: oldest first, long messages trimmed.
+pub fn format_history(msgs: &[Msg]) -> String {
+    let mut s = format!(
+        "<!-- Imported from Hermes Agent (state.db): the last {} messages of this chat. Injected once, as context for the first conversation after the move. -->\n",
+        msgs.len()
+    );
+    for m in msgs {
+        let when = chrono::DateTime::from_timestamp(m.at as i64, 0)
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let text = crate::runner::truncate(m.text.trim(), 1200);
+        s.push_str(&format!(
+            "\n**{}** ({when}): {text}\n",
+            if m.user { "User" } else { "Assistant" }
+        ));
+    }
+    s
+}
+
+/// Write `users/<chat_id>/HISTORY.md` for every allowlisted chat (DMs of allowed users and
+/// the home chat). Counts only in the report.
+pub fn import_history(
+    f: &Found,
+    p: &Profile,
+    allowed: &[u64],
+    confirm: &mut dyn FnMut(&Path) -> bool,
+) -> Vec<Row> {
+    let Some(db) = &f.state_db else {
+        return vec![("history".into(), "skipped (no state.db in Hermes)".into())];
+    };
+    let chats = match read_history(db, 30) {
+        Ok(c) => c,
+        Err(e) => {
+            return vec![(
+                "history".into(),
+                format!("skipped (can't read state.db: {e})"),
+            )];
+        }
+    };
+    let (mut written, mut skipped, mut other) = (0, 0, 0);
+    for (chat, msgs) in &chats {
+        let ok = (*chat > 0 && allowed.contains(&(*chat as u64))) || Some(*chat) == f.home_chat;
+        if !ok || msgs.is_empty() {
+            other += 1;
+            continue;
+        }
+        let dst = p.ns_dir(&chat.to_string()).join("HISTORY.md");
+        if dst.exists() && !confirm(&dst) {
+            skipped += 1;
+            continue;
+        }
+        let res = std::fs::create_dir_all(dst.parent().unwrap())
+            .and_then(|_| std::fs::write(&dst, format_history(msgs)));
+        match res {
+            Ok(()) => written += 1,
+            Err(_) => skipped += 1,
+        }
+    }
+    let mut r = format!("{written} chat(s) → users/<chat>/HISTORY.md (last 30 messages each)");
+    if skipped > 0 {
+        r.push_str(&format!(", {skipped} skipped (exists)"));
+    }
+    if other > 0 {
+        r.push_str(&format!(", {other} chat(s) not on the allowlist ignored"));
+    }
+    vec![("history".into(), r)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,14 +943,14 @@ mod tests {
 
         let p = profile(&t.path().join("cct"));
         write(&p.soul_path(), DEFAULT_SOUL); // fresh profile default: replaceable
-        let rows = import_files(&f, &p, Some(42), &mut |_| panic!("no prompt expected"));
+        let rows = import_files(&f, &p, &mut |_| panic!("no prompt expected"));
         assert!(
             rows.iter().all(|(_, r)| r.starts_with("imported")),
             "{rows:?}"
         );
         assert_eq!(fs::read_to_string(p.soul_path()).unwrap(), "hermes soul");
         assert_eq!(
-            fs::read_to_string(p.user_dir(42).join("USER.md")).unwrap(),
+            fs::read_to_string(p.dir.join("USER.md")).unwrap(), // profile-wide, like Hermes
             "Name: Ana"
         );
         let sk = p.workspace().join(".claude/skills");
@@ -828,7 +965,7 @@ mod tests {
 
         // re-import: existing content is not overwritten without confirmation
         write(&p.soul_path(), "edited");
-        let rows = import_files(&f, &p, Some(42), &mut |_| false);
+        let rows = import_files(&f, &p, &mut |_| false);
         assert_eq!(fs::read_to_string(p.soul_path()).unwrap(), "edited");
         assert!(
             rows.iter().all(|(_, r)| r.starts_with("skipped")),
@@ -845,16 +982,17 @@ mod tests {
         let f = scan(&h);
         assert!(f.token.is_none() && f.allowed.is_empty() && f.model.is_none());
         let p = profile(&t.path().join("cct"));
-        let rows = import_files(&f, &p, None, &mut |_| true);
+        let rows = import_files(&f, &p, &mut |_| true);
         assert_eq!(
-            fs::read_to_string(p.imported_dir().join("MEMORY.md")).unwrap(),
+            fs::read_to_string(p.dir.join("MEMORY.md")).unwrap(),
             "- fact"
         );
         let get = |k: &str| rows.iter().find(|(i, _)| i == k).unwrap().1.clone();
         assert!(get("SOUL.md").starts_with("skipped"));
         assert!(get("USER.md").starts_with("skipped"));
 
-        // first successful pair claims it
+        // memory left in imported/ by older versions is claimed on first pair
+        write(&p.imported_dir().join("MEMORY.md"), "- fact");
         p.claim_imported(7).unwrap();
         assert_eq!(
             fs::read_to_string(p.user_dir(7).join("MEMORY.md")).unwrap(),
@@ -1079,7 +1217,7 @@ mod tests {
         write(&h.join("skills/linux/notes/SKILL.md"), "linux");
         let f = scan(&h);
         let p = profile(&t.path().join("cct"));
-        let rows = import_files(&f, &p, None, &mut |_| true);
+        let rows = import_files(&f, &p, &mut |_| true);
         let sk = p.workspace().join(".claude/skills");
         assert_eq!(
             fs::read_to_string(sk.join("notes/SKILL.md")).unwrap(),
@@ -1101,5 +1239,83 @@ mod tests {
         );
         let f = scan(t.path());
         assert_eq!((f.allowed.clone(), f.dropped_ids), (vec![12], 2));
+    }
+
+    /// A state.db shaped like Hermes' (sessions + messages), read without modifying it.
+    #[test]
+    fn history_from_state_db_read_only() {
+        let t = tempfile::tempdir().unwrap();
+        let h = t.path().join("hermes");
+        fs::create_dir_all(&h).unwrap();
+        write(
+            &h.join(".env"),
+            "TELEGRAM_BOT_TOKEN=1:x\nTELEGRAM_HOME_CHANNEL=42\n",
+        );
+        let db = h.join("state.db");
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, user_id TEXT, chat_id TEXT, started_at REAL NOT NULL);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, timestamp REAL NOT NULL);
+                 INSERT INTO sessions VALUES ('s1','telegram','42','42',0), ('s2','telegram','99','99',0), ('s3','cli',NULL,NULL,0);",
+            )
+            .unwrap();
+            for i in 0..60 {
+                let (role, content) = if i % 3 == 2 {
+                    ("tool", "{}")
+                } else if i % 2 == 0 {
+                    ("user", "q")
+                } else {
+                    ("assistant", "a")
+                };
+                c.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1', ?1, ?2, ?3)",
+                    rusqlite::params![role, format!("{content}{i}"), i as f64],
+                )
+                .unwrap();
+            }
+            c.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','assistant','',100)", []).unwrap();
+            c.execute(&format!("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1','user','{}',101)", "x".repeat(5000)), []).unwrap();
+            c.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s2','user','other chat',1)", []).unwrap();
+            c.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s3','user','cli',1)", []).unwrap();
+        }
+        let before = fs::read(&db).unwrap();
+        let chats = read_history(&db, 30).unwrap();
+        assert_eq!(chats[&42].len(), 30);
+        assert!(
+            chats[&42]
+                .iter()
+                .all(|m| !m.text.is_empty() && !m.text.starts_with('{'))
+        );
+        assert!(!chats.contains_key(&0));
+        assert_eq!(fs::read(&db).unwrap(), before, "state.db must not change");
+
+        let f = scan(&h);
+        assert_eq!(f.state_db.as_deref(), Some(db.as_path()));
+        let p = profile(&t.path().join("cct"));
+        let rows = import_history(&f, &p, &[42], &mut |_| false);
+        assert!(
+            rows[0].1.starts_with("1 chat(s)")
+                && rows[0].1.contains("1 chat(s) not on the allowlist"),
+            "{rows:?}"
+        );
+        let hist = fs::read_to_string(p.ns_dir("42").join("HISTORY.md")).unwrap();
+        assert!(hist.contains("**User** (") && hist.contains("**Assistant** ("));
+        assert!(hist.contains('…') && hist.len() < 30 * 1300); // long message trimmed
+        assert!(!p.ns_dir("99").exists());
+    }
+
+    #[test]
+    fn workdir_from_terminal_cwd() {
+        let t = tempfile::tempdir().unwrap();
+        let wd = t.path().join("proj");
+        fs::create_dir_all(&wd).unwrap();
+        write(
+            &t.path().join("h/config.yaml"),
+            &format!("terminal:\n  cwd: {}\n", wd.display()),
+        );
+        assert_eq!(scan(&t.path().join("h")).workdir, Some(wd));
+        write(&t.path().join("h/config.yaml"), "terminal:\n  cwd: .\n");
+        assert_eq!(scan(&t.path().join("h")).workdir, None); // relative: ignored
     }
 }

@@ -24,12 +24,14 @@ cc-gateway import hermes [--only <name>]... [--profile <name>] [--hermes-home <p
 
 | Hermes | cc-gateway |
 |--------|------------|
-| `.env` `TELEGRAM_BOT_TOKEN` | `bot_token`, checked live with Telegram. If invalid or missing, the wizard asks for one; without prompts, the existing profile's token is kept, or that profile is skipped ("no Telegram bot token in Hermes"). |
+| `.env` `TELEGRAM_BOT_TOKEN` | `bot_token`, checked live with Telegram (network errors are retried for about a minute; if Telegram stays unreachable the token is imported anyway and marked "not verified — network"). If Telegram rejects it or it's missing, the wizard asks for one; without prompts, the existing profile's token is kept, or that profile is skipped ("no Telegram bot token in Hermes"). |
 | `.env` `DISCORD_BOT_TOKEN` without a Telegram token | The profile is skipped: "Discord-only, skipped (Discord isn't supported by cc-gateway)". |
 | Who may use the bot (see below) | Merged into `allowed_user_ids` |
-| The owner (see below) | Owner of the imported memory and cron jobs |
+| The owner (see below) | Owner of the imported cron jobs |
 | `SOUL.md` | `SOUL.md` |
-| `memories/MEMORY.md`, `memories/USER.md` | `users/<owner>/`. Without an owner: with one allowed id, that id. With several, you pick (without prompts: the first, with a note). With none, the files wait in `imported/` and move to the first user who pairs. |
+| `memories/MEMORY.md`, `memories/USER.md` | `<profile>/MEMORY.md` and `<profile>/USER.md`: **shared** memory, injected for every user of the bot, exactly like Hermes (where these files are profile-wide). |
+| `state.db` (conversation history) | `users/<chat_id>/HISTORY.md` for each allowlisted Telegram chat: the last 30 user/assistant text messages, oldest first, long ones trimmed. It's injected only until that chat's first cc-gateway session is stored, so the first conversation continues from Hermes. The database is opened read-only and immutable; it's never written. |
+| `terminal.cwd` (config.yaml) / `TERMINAL_CWD` (.env), if it's an absolute path that exists | `workdir`: claude's working dir. The workspace is added with `--add-dir`, so the imported skills still load. Context files Hermes reads from that dir (`.hermes.md`, `HERMES.md`, `AGENTS.md`) are injected the same way; `CLAUDE.md` is loaded by claude itself. |
 | `config.yaml` `model.default` (or `model: <id>`) | `default_model`, for new profiles only, and only if it's clearly a Claude model (→ `opus`, `sonnet` or `haiku`). Anything else, e.g. `gpt-5.6-sol`, keeps the cc-gateway default, and the summary says "(not a Claude model: keeps the cc-gateway default)". |
 | `skills/**/<skill>/SKILL.md` | Copied **flat** to `workspace/.claude/skills/<skill>/`. Claude Code only discovers `.claude/skills/<name>/SKILL.md`, not nested category folders, so `skills/apple/notes/` becomes `.claude/skills/notes/`. Symlinks are followed (contents are copied); folders without `SKILL.md` and `.hub/` are skipped. If two categories hold a skill with the same name, the second one is copied as `<category>-<name>` and reported as renamed. |
 | `cron/jobs.json` | The owner's `schedules.json`, posted to the home chat (see [Cron jobs](#cron-jobs)) |

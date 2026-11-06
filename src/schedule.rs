@@ -387,6 +387,8 @@ pub async fn run_loop(app: Arc<App>) {
                         user_id: uid,
                         prompt: s.prompt,
                         scheduled: true,
+                        sender: "a scheduled task (no one is waiting for a reply)".into(),
+                        typing: None,
                     },
                 );
             }

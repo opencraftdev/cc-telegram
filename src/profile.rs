@@ -36,6 +36,10 @@ pub struct Config {
     /// the smallest value among the profiles applies.
     #[serde(default = "d_max_runs")]
     pub max_concurrent_runs: usize,
+    /// Working directory for claude (e.g. Hermes' terminal.cwd). Default: the profile workspace.
+    /// The workspace is then added with --add-dir so its skills, inbox and outbox still work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
     #[serde(default)]
     pub voice: Voice,
     #[serde(default)]
@@ -128,6 +132,7 @@ impl Config {
             claude_bin: d_claude(),
             extra_claude_args: vec![],
             max_concurrent_runs: d_max_runs(),
+            workdir: None,
             voice: Voice::default(),
             api: Api::default(),
         }
@@ -375,6 +380,22 @@ impl Profile {
         Ok(ProfileLock(f))
     }
 
+    /// claude's cwd and the extra args it needs: `workdir` if set and present (plus
+    /// `--add-dir <workspace>`, which also makes claude load the workspace's skills),
+    /// else the workspace.
+    pub fn claude_cwd(&self, cfg: &Config) -> (PathBuf, Vec<String>) {
+        match cfg.workdir.as_deref().map(expand_tilde) {
+            Some(w) if w.is_dir() => (
+                w,
+                vec![
+                    "--add-dir".into(),
+                    self.workspace().to_string_lossy().into_owned(),
+                ],
+            ),
+            _ => (self.workspace(), vec![]),
+        }
+    }
+
     pub fn load_config(&self) -> Result<Config> {
         let path = self.config_path();
         let s = std::fs::read_to_string(&path)
@@ -534,6 +555,26 @@ mod tests {
         assert!(s.contains(&format!("{}/.cc-gateway/bin/claude", t.path().display())));
         assert!(!s.contains(".cc-telegram"));
         assert_eq!(rewrite_old_paths(&profiles, t.path()).unwrap(), 0); // idempotent
+    }
+
+    #[test]
+    fn claude_cwd_uses_workdir_and_keeps_workspace_skills() {
+        let t = tempfile::tempdir().unwrap();
+        let p = Profile {
+            name: "t".into(),
+            dir: t.path().join("p"),
+        };
+        let mut c = Config::new(String::new());
+        assert_eq!(p.claude_cwd(&c), (p.workspace(), vec![]));
+        c.workdir = Some(t.path().display().to_string());
+        let (cwd, args) = p.claude_cwd(&c);
+        assert_eq!(cwd, t.path());
+        assert_eq!(
+            args,
+            vec!["--add-dir".to_string(), p.workspace().display().to_string()]
+        );
+        c.workdir = Some("/nonexistent/dir".into()); // gone: fall back to the workspace
+        assert_eq!(p.claude_cwd(&c).0, p.workspace());
     }
 
     #[test]

@@ -15,6 +15,8 @@ max_turns = 30                     # --max-turns
 run_timeout_secs = 900             # kill the claude process group after this
 claude_bin = "claude"              # path to the claude CLI (~ is expanded)
 extra_claude_args = []             # appended verbatim, e.g. ["--add-dir", "/Users/me/code"]
+workdir = "/home/me/project"       # optional: claude's working dir (default: the profile workspace);
+                                   # the workspace is then added with --add-dir so its skills load
 max_concurrent_runs = 2            # cap on concurrent claude processes in this process
                                    # (Telegram + API + cron; with run --all the smallest value wins)
 
@@ -53,11 +55,12 @@ created_at = "2026-11-06T10:00:00+07:00"
 | `state.json` | Per Telegram chat: session id, model override, last cost, `/new` counter |
 | `pair.json` | Active pair codes and failed-attempt counters |
 | `sessions.json` | Claude session id → owner (`tg:<chat>` or `key:<name>`); only the owner can resume it |
-| `users/<telegram_id>/` | `USER.md`, `MEMORY.md`, `schedules.json` (fields: [telegram.md](telegram.md#schedules)) |
+| `MEMORY.md`, `USER.md` | Shared memory for everyone using the bot ([telegram.md](telegram.md#memory)) |
+| `users/<telegram_id>/` | This person's `USER.md`, `MEMORY.md`; `schedules.json` (fields: [telegram.md](telegram.md#schedules)); `HISTORY.md` (imported chat history) |
 | `users/key-<name>/` | `USER.md`, `MEMORY.md` for an API key |
-| `imported/` | Imported memory waiting for its owner to pair ([hermes-import.md](hermes-import.md)) |
+| `imported/` | Memory left by imports from older versions; moved to the first user who pairs |
 | `logs/bot.log` | Gateway log (`logs/service.log` holds launchd's stdout/stderr) |
-| `workspace/` | Working directory for every claude run (sessions are tied to it) |
+| `workspace/` | Working directory for every claude run, unless `workdir` is set |
 | `workspace/inbox/`, `workspace/outbox/` | Files received and files to send back |
 | `workspace/.claude/skills/` | Claude Code skills available to every run (flat: `<name>/SKILL.md`) |
 | `workspace/scripts/` | Scripts for command jobs (e.g. imported from Hermes) |

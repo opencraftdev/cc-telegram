@@ -37,7 +37,7 @@ If you need the API from another machine, keep `bind = "127.0.0.1:8787"` and put
 
 ## Memory isolation
 
-Each Telegram user (`users/<id>/`) and each API key (`users/key-<name>/`) gets its own USER.md and MEMORY.md. This prevents **accidental** mixing: Claude is only told about the current user's files. It is **not** a security boundary. Because Claude has full file access, any allowlisted user or key holder can ask it to read `config.toml` (the bot token and key hashes), other users' memory files, or anything else your OS user can read.
+The profile's `MEMORY.md` and `USER.md` are **shared by everyone** who uses the bot (Telegram users and API keys), as in Hermes Agent; don't let Claude put one user's private details there. Each Telegram user (`users/<id>/`) and each API key (`users/key-<name>/`) also gets their own USER.md and MEMORY.md. This prevents **accidental** mixing: Claude is only told about the current user's own files. It is **not** a security boundary. Because Claude has full file access, any allowlisted user or key holder can ask it to read `config.toml` (the bot token and key hashes), other users' memory files, or anything else your OS user can read.
 
 ## Environment
 

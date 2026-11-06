@@ -30,6 +30,58 @@ pub struct Job {
     pub prompt: String,
     /// Cron runs: fresh session, output prefixed with ⏰.
     pub scheduled: bool,
+    /// "Full Name (@username)" of the sender, for the prompt.
+    pub sender: String,
+    /// Typing indicator started when the message was accepted; lives until the job ends.
+    pub typing: Option<TypingGuard>,
+}
+
+/// Shows a chat action ("typing…") now and every 4s until dropped. Each request is capped at
+/// 3s and errors are ignored, so a slow or failing request never delays the next one.
+pub struct TypingGuard {
+    task: tokio::task::JoinHandle<()>,
+    action: Arc<std::sync::Mutex<ChatAction>>,
+}
+
+impl TypingGuard {
+    pub fn start(bot: Bot, chat: ChatId) -> Self {
+        Self::start_with(move |a| {
+            let bot = bot.clone();
+            async move {
+                let _ = bot.send_chat_action(chat, a).await;
+            }
+        })
+    }
+
+    pub fn start_with<F, Fut>(send: F) -> Self
+    where
+        F: Fn(ChatAction) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let action = Arc::new(std::sync::Mutex::new(ChatAction::Typing));
+        let a = action.clone();
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(4));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await; // first tick fires immediately
+                let now = *a.lock().unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(3), send(now)).await;
+            }
+        });
+        Self { task, action }
+    }
+
+    /// Switch the action shown from the next tick on (e.g. UploadDocument).
+    pub fn set(&self, a: ChatAction) {
+        *self.action.lock().unwrap() = a;
+    }
+}
+
+impl Drop for TypingGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 fn tg_key(chat: i64) -> String {
@@ -45,16 +97,123 @@ pub fn enqueue(app: &Arc<App>, job: Job) {
     );
 }
 
+/// Telegram API addresses (149.154.160.0/20) tried after the DNS answer, so a broken route
+/// or flaky DNS for api.telegram.org isn't fatal. Same seeds as Hermes Agent.
+const TELEGRAM_FALLBACK_IPS: [&str; 2] = ["149.154.166.110", "149.154.167.220"];
+
+/// A Bot whose HTTP client resolves api.telegram.org to the system DNS answer (if any, 4s
+/// max) followed by the fallback IPs; the connector tries them in order.
+pub async fn telegram_bot(token: &str) -> Bot {
+    let lookup = tokio::time::timeout(
+        Duration::from_secs(4),
+        tokio::net::lookup_host("api.telegram.org:443"),
+    )
+    .await;
+    let mut addrs: Vec<std::net::SocketAddr> = match lookup {
+        Ok(Ok(found)) => found.collect(),
+        _ => vec![],
+    };
+    for ip in TELEGRAM_FALLBACK_IPS {
+        if let Ok(a) = format!("{ip}:443").parse()
+            && !addrs.contains(&a)
+        {
+            addrs.push(a);
+        }
+    }
+    match teloxide::net::default_reqwest_settings()
+        .resolve_to_addrs("api.telegram.org", &addrs)
+        .build()
+    {
+        Ok(client) => Bot::with_client(token, client),
+        Err(_) => Bot::new(token),
+    }
+}
+
+/// Why getMe failed: Telegram said no (HTTP 401/404), or we couldn't reach it.
+#[derive(Debug, PartialEq)]
+pub enum MeError {
+    Rejected(String),
+    Network(String),
+}
+
+impl std::fmt::Display for MeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MeError::Rejected(e) => write!(f, "✗ token rejected by Telegram ({e})"),
+            MeError::Network(e) => write!(f, "✗ can't reach Telegram (network): {e}"),
+        }
+    }
+}
+
+/// Only 401/404 (teloxide: `InvalidToken`) mean the token is bad; everything else
+/// (connect/timeout/IO/5xx/429) is worth retrying.
+pub fn is_rejected(e: &teloxide::RequestError) -> bool {
+    matches!(
+        e,
+        teloxide::RequestError::Api(teloxide::ApiError::InvalidToken)
+    )
+}
+
+/// 1s, 2s, 4s … capped at `cap_secs`.
+pub fn me_delay(attempt: u32, cap_secs: u64) -> Duration {
+    Duration::from_secs((1u64 << attempt.min(20)).min(cap_secs))
+}
+
+/// Run `op` until it succeeds or the error is a rejection; network errors are retried with
+/// backoff, `attempts` times in total (None = forever). `on_retry(attempt, error, wait)`.
+pub async fn retry_network<T, F, Fut>(
+    attempts: Option<u32>,
+    cap_secs: u64,
+    op: F,
+    on_retry: &(dyn Fn(u32, &str, Duration) + Sync),
+) -> std::result::Result<T, MeError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, teloxide::RequestError>>,
+{
+    let mut n = 0;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_rejected(&e) => return Err(MeError::Rejected(e.to_string())),
+            Err(e) => {
+                n += 1;
+                if attempts.is_some_and(|a| n >= a) {
+                    return Err(MeError::Network(e.to_string()));
+                }
+                let wait = me_delay(n - 1, cap_secs);
+                on_retry(n, &e.to_string(), wait);
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// getMe for CLI flows: 8 attempts, 1s→16s (~1 min), progress on stderr.
+pub async fn get_me_cli(token: &str) -> std::result::Result<String, MeError> {
+    let bot = telegram_bot(token).await;
+    retry_network(Some(8), 16, || bot.get_me().into_future(), &|n, e, wait| {
+        eprintln!(
+            "  … can't reach Telegram ({e}); retrying in {}s (attempt {n}/8)",
+            wait.as_secs()
+        )
+    })
+    .await
+    .map(|me| me.username().to_string())
+}
+
 /// The Telegram gateway: long polling until the process exits.
 pub async fn run(profile: Profile, queues: Arc<Queues>, owners: Arc<SessionOwners>) -> Result<()> {
     let cfg = profile.load_config()?;
-    let bot = Bot::new(&cfg.bot_token);
-    let me = bot.get_me().await.map_err(|e| {
-        anyhow::anyhow!(
-            "✗ token rejected by Telegram ({e}) → run: cc-gateway profile edit {}",
-            profile.name
-        )
-    })?;
+    let bot = telegram_bot(&cfg.bot_token).await;
+    // Network trouble at startup: keep trying in-process (cap 5 min) instead of exiting into a
+    // systemd restart loop. Only a rejected token is fatal.
+    let name = profile.name.clone();
+    let me = retry_network(None, 300, || bot.get_me().into_future(), &|n, e, wait| {
+        warn!(profile = %name, "can't reach Telegram ({e}); retrying getMe in {}s (attempt {n})", wait.as_secs())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e} → run: cc-gateway profile edit {}", profile.name))?;
     info!(profile = %profile.name, bot = %me.username(), "bot running");
     let app = Arc::new(App {
         bot: bot.clone(),
@@ -243,21 +402,21 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
                 return Ok(());
             }
             "memory" => {
-                let dir = app.profile.user_dir(uid);
-                let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
-                let (m, u) = (read("MEMORY.md"), read("USER.md"));
+                let read = |p: std::path::PathBuf| {
+                    let s = std::fs::read_to_string(p).unwrap_or_default();
+                    if s.trim().is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        s.trim().to_string()
+                    }
+                };
+                let (shared, mine) = (&app.profile.dir, app.profile.user_dir(uid));
                 let text = format!(
-                    "MEMORY.md\n{}\n\nUSER.md\n{}",
-                    if m.trim().is_empty() {
-                        "(empty)"
-                    } else {
-                        m.trim()
-                    },
-                    if u.trim().is_empty() {
-                        "(empty)"
-                    } else {
-                        u.trim()
-                    },
+                    "Shared (everyone using this bot)\n\nMEMORY.md\n{}\n\nUSER.md\n{}\n\nAbout you\n\nUSER.md\n{}\n\nMEMORY.md\n{}",
+                    read(shared.join("MEMORY.md")),
+                    read(shared.join("USER.md")),
+                    read(mine.join("USER.md")),
+                    read(mine.join("MEMORY.md")),
                 );
                 for chunk in split_message(&text, 4096) {
                     reply(chunk).await?;
@@ -322,6 +481,8 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
         }
     }
 
+    // Typing from now on: through media download/transcription, queueing, the run and the reply.
+    let typing = TypingGuard::start(app.bot.clone(), chat);
     let prompt = match media::to_prompt(&app.bot, &app.profile, &cfg, &msg, uid).await {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(()),
@@ -337,6 +498,11 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
             user_id: uid,
             prompt,
             scheduled: false,
+            sender: match &user.username {
+                Some(u) => format!("{} (@{u})", user.full_name()),
+                None => user.full_name(),
+            },
+            typing: Some(typing),
         },
     );
     Ok(())
@@ -369,8 +535,13 @@ async fn on_callback(app: Arc<App>, q: CallbackQuery) -> Result<()> {
 }
 
 /// Run one queued job: status message, claude run, reply, outbox, persist session.
-pub async fn run_job(app: &Arc<App>, job: Job, stop: Arc<Notify>) {
-    if let Err(e) = try_run_job(app, &job, stop).await {
+pub async fn run_job(app: &Arc<App>, mut job: Job, stop: Arc<Notify>) {
+    // Messages arrive with typing already on; cron jobs get it only while running.
+    let typing = job
+        .typing
+        .take()
+        .unwrap_or_else(|| TypingGuard::start(app.bot.clone(), ChatId(job.chat_id)));
+    if let Err(e) = try_run_job(app, &job, &typing, stop).await {
         warn!("job failed: {e:#}");
         let _ = app
             .bot
@@ -379,7 +550,12 @@ pub async fn run_job(app: &Arc<App>, job: Job, stop: Arc<Notify>) {
     }
 }
 
-async fn try_run_job(app: &Arc<App>, job: &Job, stop: Arc<Notify>) -> Result<()> {
+async fn try_run_job(
+    app: &Arc<App>,
+    job: &Job,
+    typing: &TypingGuard,
+    stop: Arc<Notify>,
+) -> Result<()> {
     let cfg = app.profile.load_config()?;
     let chat = ChatId(job.chat_id);
     let cs = app.state.get(job.chat_id);
@@ -403,18 +579,41 @@ async fn try_run_job(app: &Arc<App>, job: &Job, stop: Arc<Notify>) -> Result<()>
         .ok()
         .map(|m| m.id);
     let started = Instant::now();
+    let (cwd, cwd_args) = app.profile.claude_cwd(&cfg);
+    // Imported chat history: only until this chat's first session is stored, then never.
+    let history_path = app
+        .profile
+        .ns_dir(&job.chat_id.to_string())
+        .join("HISTORY.md");
+    let history = (!job.scheduled && cs.session_id.is_none() && !cs.history_done)
+        .then(|| std::fs::read_to_string(&history_path).ok())
+        .flatten()
+        .filter(|h| !h.trim().is_empty());
+    let with_history = history.is_some();
+    let outbox = app.profile.outbox(job.chat_id);
+    std::fs::create_dir_all(&outbox)?;
+    let system_prompt = prompt::assemble(
+        &app.profile,
+        &job.user_id.to_string(),
+        prompt::Channel::Telegram {
+            sender: job.sender.clone(),
+            outbox,
+        },
+        &cwd,
+        history,
+    )?;
     let mut opts = RunOpts {
         claude_bin: crate::profile::expand_tilde(&cfg.claude_bin)
             .to_string_lossy()
             .into(),
         prompt: job.prompt.clone(),
-        system_prompt: prompt::for_user(&app.profile, job.user_id, job.chat_id)?,
+        system_prompt,
         model: cs.model.unwrap_or(cfg.default_model.clone()),
         max_turns: cfg.max_turns,
         // cron runs get a fresh session so they don't pollute the chat context
         resume: if job.scheduled { None } else { cs.session_id },
-        extra_args: cfg.extra_claude_args.clone(),
-        cwd: app.profile.workspace(),
+        extra_args: [cwd_args, cfg.extra_claude_args.clone()].concat(),
+        cwd,
         timeout: Duration::from_secs(cfg.run_timeout_secs),
     };
     let mut note = "";
@@ -446,6 +645,9 @@ async fn try_run_job(app: &Arc<App>, job: &Job, stop: Arc<Notify>) -> Result<()>
         Outcome::Done(r) => {
             app.state
                 .update(chat.0, |c| c.last_cost_usd = Some(r.cost_usd));
+            if with_history && !r.is_error && r.session_id.is_some() {
+                app.state.update(chat.0, |c| c.history_done = true);
+            }
             keep_session(r.session_id.clone());
             let body = if r.is_error {
                 let why = if r.errors.is_empty() {
@@ -501,7 +703,7 @@ async fn try_run_job(app: &Arc<App>, job: &Job, stop: Arc<Notify>) -> Result<()>
     if let Some(id) = status {
         let _ = app.bot.edit_message_text(chat, id, status_text).await;
     }
-    send_outbox(&app.bot, chat, &app.profile.outbox(chat.0)).await;
+    send_outbox(&app.bot, chat, &app.profile.outbox(chat.0), typing).await;
     Ok(())
 }
 
@@ -519,7 +721,6 @@ async fn run_with_status(
         let mut lines: Vec<String> = vec![];
         let mut dirty = false;
         let mut edit = tokio::time::interval(Duration::from_millis(1500));
-        let mut typing = tokio::time::interval(Duration::from_secs(4));
         loop {
             tokio::select! {
                 step = rx.recv() => match step {
@@ -534,12 +735,14 @@ async fn run_with_status(
                 },
                 _ = edit.tick() => if dirty && let Some(id) = status {
                     let text = format!("{header}⏳ working…\n{}", lines.join("\n"));
-                    let _ = app.bot.edit_message_text(chat, id, text).await;
+                    // bounded, so a hung edit on a flaky network can't stall the loop
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        app.bot.edit_message_text(chat, id, text).into_future(),
+                    )
+                    .await;
                     dirty = false;
                 },
-                _ = typing.tick() => {
-                    let _ = app.bot.send_chat_action(chat, ChatAction::Typing).await;
-                }
             }
         }
     };
@@ -590,7 +793,7 @@ pub async fn send_long(bot: &Bot, chat: ChatId, text: &str) {
     }
 }
 
-async fn send_outbox(bot: &Bot, chat: ChatId, dir: &Path) {
+async fn send_outbox(bot: &Bot, chat: ChatId, dir: &Path, typing: &TypingGuard) {
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -606,6 +809,11 @@ async fn send_outbox(bot: &Bot, chat: ChatId, dir: &Path) {
             .unwrap_or("")
             .to_ascii_lowercase();
         let is_photo = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp");
+        typing.set(if is_photo {
+            ChatAction::UploadPhoto
+        } else {
+            ChatAction::UploadDocument
+        });
         let photo_ok = is_photo && bot.send_photo(chat, InputFile::file(&path)).await.is_ok();
         let ok = photo_ok
             || bot
@@ -618,6 +826,7 @@ async fn send_outbox(bot: &Bot, chat: ChatId, dir: &Path) {
             warn!(file = %path.display(), "could not send outbox file");
         }
     }
+    typing.set(ChatAction::Typing);
 }
 
 // ---------- formatting ----------
@@ -704,6 +913,117 @@ pub fn to_markdown_v2(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_guard_sends_now_repeats_and_stops_on_drop() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<ChatAction>::new()));
+        let s2 = sent.clone();
+        let g = TypingGuard::start_with(move |a| {
+            let s = s2.clone();
+            async move { s.lock().unwrap().push(a) }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(*sent.lock().unwrap(), vec![ChatAction::Typing]); // immediately
+        g.set(ChatAction::UploadDocument);
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        assert_eq!(sent.lock().unwrap().len(), 3); // 0s, 4s, 8s
+        assert_eq!(
+            *sent.lock().unwrap().last().unwrap(),
+            ChatAction::UploadDocument
+        );
+        drop(g);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(sent.lock().unwrap().len(), 3); // stopped
+
+        // a hanging request is cut at 3s and the next one still goes out on time
+        let n = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let n2 = n.clone();
+        let _g = TypingGuard::start_with(move |_| {
+            let n = n2.clone();
+            async move {
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<()>().await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(8010)).await;
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    fn io_err() -> teloxide::RequestError {
+        teloxide::RequestError::Io(Arc::new(std::io::Error::other("connection reset")))
+    }
+
+    #[test]
+    fn only_invalid_token_is_a_rejection() {
+        assert!(is_rejected(&teloxide::RequestError::Api(
+            teloxide::ApiError::InvalidToken
+        )));
+        assert!(!is_rejected(&io_err()));
+        assert!(!is_rejected(&teloxide::RequestError::RetryAfter(
+            teloxide::types::Seconds::from_seconds(1)
+        )));
+        assert!(!is_rejected(&teloxide::RequestError::Api(
+            teloxide::ApiError::Unknown("Bad Gateway".into())
+        )));
+        let d: Vec<u64> = (0..8).map(|a| me_delay(a, 16).as_secs()).collect();
+        assert_eq!(d, vec![1, 2, 4, 8, 16, 16, 16, 16]);
+        assert_eq!(me_delay(30, 300).as_secs(), 300);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_errors_retry_rejections_dont() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let count = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // a blip: fails twice, then works
+        let r = retry_network(
+            Some(8),
+            16,
+            || async { if count() < 2 { Err(io_err()) } else { Ok(7) } },
+            &|_, _, _| {},
+        )
+        .await;
+        assert_eq!(r, Ok(7));
+        // down for good: gives up after 8 attempts as Network
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let r: std::result::Result<(), _> = retry_network(
+            Some(8),
+            16,
+            || async {
+                count();
+                Err(io_err())
+            },
+            &|_, _, _| {},
+        )
+        .await;
+        assert!(matches!(r, Err(MeError::Network(_))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 8);
+        // rejected: no retry
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let r: std::result::Result<(), _> = retry_network(
+            Some(8),
+            16,
+            || async {
+                count();
+                Err(teloxide::RequestError::Api(
+                    teloxide::ApiError::InvalidToken,
+                ))
+            },
+            &|_, _, _| {},
+        )
+        .await;
+        assert!(matches!(r, Err(MeError::Rejected(_))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            MeError::Network("x".into())
+                .to_string()
+                .starts_with("✗ can't reach Telegram (network)")
+        );
+        assert!(
+            MeError::Rejected("x".into())
+                .to_string()
+                .starts_with("✗ token rejected")
+        );
+    }
 
     #[test]
     fn commands() {

@@ -34,6 +34,14 @@ Install Claude Code, run `claude` once to log in, then retry. If claude works in
 
 Telegram answers `✗ claude failed: … → run: cc-gateway doctor`; the API returns 500 `server_error` with the same text.
 
+## Can't reach Telegram (network)
+
+```
+✗ can't reach Telegram (network): …
+```
+
+The machine couldn't connect to api.telegram.org; this is different from a bad token. Setup, import and doctor retry 8 times over about a minute; the running bot retries forever (backing off to 5 minutes) instead of exiting, and long polling rides out network errors on its own. cc-gateway also tries Telegram's fallback addresses (149.154.166.110, 149.154.167.220) after the DNS answer, like Hermes. The import keeps a Hermes token it couldn't verify ("not verified — network").
+
 ## Token rejected
 
 ```
