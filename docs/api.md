@@ -171,7 +171,7 @@ client.chat.completions.create(
 )
 ```
 
-Requests on the same session run one at a time. Requests without a session run in parallel, up to `max_concurrent`.
+Requests on the same session run one at a time. Requests without a session run in parallel, up to `max_concurrent` (more → 429). Actual claude processes are additionally capped process-wide by `max_concurrent_runs` (default 2, shared with Telegram and cron): accepted requests beyond that wait for a slot rather than failing.
 
 A session belongs to the key that created it. Resuming a session id that this key didn't create (unknown, another key's, or a Telegram chat's) returns 404 `session_not_found`.
 

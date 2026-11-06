@@ -27,6 +27,10 @@ Repository: `github.com/opencraftdev/cc-gateways` (renamed from `cc-telegram`).
 | 17 | API | **axum**, OpenAI-compatible `/v1/chat/completions` + `/v1/models`, plus a native `/v1/runs` API. Loopback bind by default; non-loopback prints a loud warning. |
 | 18 | API auth | Bearer keys `ccg_…` created by `cc-gateway key create`; only sha256 + name + created_at are stored. Each key has its own memory namespace `users/key-<name>/`. |
 | 19 | API concurrency | Same per-conversation queues as Telegram; API runs are queued by session id (`session:<id>`), so one session never runs twice at once. Global `max_concurrent` cap → 429. Sessions belong to their creator (`sessions.json`): only the API key that created a session can resume it; Telegram sessions can't be resumed over the API. |
+| 20 | Hermes server import | Allowlist derived like Hermes' authz (`gateway/authz_mixin.py`): `TELEGRAM_ALLOWED_USERS` ∪ `GATEWAY_ALLOWED_USERS` ∪ approved pairings ∪ the home-channel owner. Hermes allow-all is **not** imported (owner only, with a warning). Discord-only profiles are skipped. |
+| 21 | Cron import | Hermes `cron/jobs.json` → our schedules: agent jobs → prompt jobs, `no_agent` script jobs → **command jobs** (argv, no shell, no claude). `enabled`, interval schedules and silent (`deliver = false`) jobs are supported. |
+| 22 | RAM | Process-wide cap `max_concurrent_runs` (default 2) on concurrent claude processes, shared by Telegram, API and cron; waiting jobs queue (Telegram shows `⏳ queued (n ahead)`). |
+| 23 | Multi-profile | `cc-gateway run --all` runs every profile in one process; `service install --all` installs one unit for it and refuses if per-profile units exist (double polling → 409). |
 
 > Why Rust: a single-binary distribution for others to use. It does **not** improve agent memory (that lives in markdown + Claude sessions) or meaningfully reduce RAM (each `claude` process is ~200–400MB of Node no matter what).
 
@@ -79,19 +83,23 @@ Every prompt has a sane default, so pressing Enter all the way through works (ex
 
 ### Hermes import
 
-If a [Hermes Agent](https://github.com/NousResearch/hermes-agent) install is found (`$HERMES_HOME`, else `~/.hermes`), `setup` offers to import it right after the Claude Code check: it lists what it found (counts and yes/no flags only, never secret values) and asks `Hermes Agent found at ~/.hermes. Import it? [Y/n]`. Hermes profiles (`~/.hermes/profiles/<name>/`, a dir with `config.yaml`, `.env`, `SOUL.md`, `profile.yaml`, `auth.json` or `state.db`) are offered too (multi-select); the root becomes `default` (or a name you pick), others keep their name. Non-interactive: `setup --import-hermes` / `--no-import-hermes` (`--token` overrides the root's token). Standalone: `cc-gateway import hermes [--profile <name>] [--hermes-home <path>] [--yes]`. Nothing in the Hermes home is written.
+If a [Hermes Agent](https://github.com/NousResearch/hermes-agent) install is found (`$HERMES_HOME`, else `~/.hermes`), `setup` offers to import it right after the Claude Code check: it lists what it found (counts and yes/no flags only, never secret values) and asks `Hermes Agent found at ~/.hermes. Import it? [Y/n]`. Hermes profiles (`~/.hermes/profiles/<name>/`, a dir with `config.yaml`, `.env`, `SOUL.md`, `profile.yaml`, `auth.json` or `state.db`) are offered too (multi-select, **none selected by default**); the root becomes `default` (or a name you pick), others keep their name. Non-interactive: `setup --import-hermes --only <name>…` / `--no-import-hermes` (`--token` overrides the root's token). Standalone: `cc-gateway import hermes [--only <name>]... [--profile <name>] [--hermes-home <path>] [--yes]`. Without a terminal or with `--yes`, nothing is imported unless `--only` picks profiles (`root` = top level), since every imported bot starts being polled by cc-gateway; a `--hermes-home` pointing at `profiles/<name>` counts as picking that profile and keeps its name. Nothing in the Hermes home is written.
 
 | Hermes | cc-gateway |
 |--------|-------------|
 | `.env` `TELEGRAM_BOT_TOKEN` | `bot_token` (validated with `getMe`; if invalid/missing: ask, or skip non-interactively) |
-| `.env` `TELEGRAM_ALLOWED_USERS` (comma-separated ids) | merged into `allowed_user_ids` |
+| `.env` `TELEGRAM_ALLOWED_USERS`, `GATEWAY_ALLOWED_USERS` (comma-separated ids), approved pairings (`pairing/telegram-approved.json` if that legacy dir has content, else `platforms/pairing/telegram-approved.json`), plus the owner | merged into `allowed_user_ids`. If Hermes allows everyone (`TELEGRAM_ALLOW_ALL_USERS` / `GATEWAY_ALLOW_ALL_USERS` true, or `*` in a list) only the owner is imported, with a warning |
+| owner: `config.yaml` `platforms.telegram.home_channel.user_id`, else a private (positive) `TELEGRAM_HOME_CHANNEL`, else the single allowed user | default memory owner and owner of imported cron jobs |
+| home chat: `home_channel.chat_id`, else `TELEGRAM_HOME_CHANNEL`, else the owner's DM | `chat_id` of imported cron jobs |
+| `cron/jobs.json` | owner's `schedules.json` (see Scheduling); `scripts/` → `workspace/scripts/` when script jobs are imported |
 | `SOUL.md` | `SOUL.md` |
-| `memories/MEMORY.md`, `memories/USER.md` (single owner) | `users/<owner>/`: the one allowed id; if several, you pick (non-interactive: first, with a note); if none, `imported/` and moved to the first user who pairs |
+| `memories/MEMORY.md`, `memories/USER.md` (single owner) | `users/<owner>/`; without an owner: the one allowed id; if several, you pick (non-interactive: first, with a note); if none, `imported/` and moved to the first user who pairs |
 | `config.yaml` `model.default` (or `model: <id>`) | `default_model` only if clearly Claude (→ `opus`/`sonnet`/`haiku`), else our default is kept and the summary says so |
-| `skills/**/<skill>/SKILL.md` (category folders, symlinks followed, `.hub` skipped) | copied to `workspace/.claude/skills/<skill>/` so `claude -p` picks them up |
+| `skills/**/<skill>/SKILL.md` (category folders, symlinks followed, `.hub` skipped) | copied **flat** to `workspace/.claude/skills/<skill>/` (Claude Code only discovers `.claude/skills/<name>/SKILL.md`, not nested category folders; verified with claude 2.1.x) |
 
+- Profiles with only a Discord bot (`DISCORD_BOT_TOKEN`, no `TELEGRAM_BOT_TOKEN`) are reported "Discord-only, skipped (Discord isn't supported)". Profiles with no bot token at all are asked for one (wizard) or skipped (non-interactive).
 - Partial installs are fine: missing items are reported as skipped. Existing cc-gateway files with content are never overwritten without confirmation (`--yes` overrides). A summary table of imported/skipped items is printed per profile.
-- **Token conflict:** two pollers on one token make Telegram answer `409 Conflict`. When the token came from Hermes the importer warns and suggests `hermes gateway stop` (`hermes -p <name> gateway stop` for a Hermes profile) or a new bot. At runtime a 409 from `getUpdates` is logged with the same hint.
+- **Token conflict:** two pollers on one token make Telegram answer `409 Conflict`. When the token came from Hermes the importer warns and suggests `systemctl --user disable --now hermes-gateway-<name>.service` (or `hermes -p <name> gateway stop`; `hermes gateway stop` for the root) or a new bot. At runtime a 409 from `getUpdates` is logged per profile, naming the likely Hermes unit; polling retries with backoff and other profiles are unaffected.
 
 ### Adding other users later: pair codes
 
@@ -145,17 +153,20 @@ cc-gateway profile delete <name>      # confirms; deletes the dir
 cc-gateway allow <name> <user_id>     # add to allowlist
 cc-gateway deny  <name> <user_id>
 cc-gateway run <name>                 # foreground; starts the enabled gateways
+cc-gateway run --all                  # every profile in one process (shared run cap)
 cc-gateway key create <profile> <name>  # API key, printed once
 cc-gateway key list <profile>
 cc-gateway key revoke <profile> <name>
-cc-gateway service install <name>     # launchd/systemd, auto-restart
-cc-gateway service uninstall <name>
-cc-gateway service status <name>
+cc-gateway service install <name>|--all   # launchd/systemd, auto-restart
+cc-gateway service uninstall <name>|--all
+cc-gateway service status <name>|--all
 cc-gateway doctor                     # checks claude, ffmpeg, whisper-cli, token validity
-cc-gateway import hermes [--profile <name>] [--hermes-home <path>] [--yes]   # import Hermes Agent
+cc-gateway import hermes [--only <name>]... [--profile <name>] [--hermes-home <path>] [--yes]
 ```
 
-Service units: launchd label `dev.opencraft.cc-gateway.<profile>` (`~/Library/LaunchAgents`), systemd template `cc-gateway@.service` with one instance `cc-gateway@<profile>` per profile.
+Service units: launchd label `dev.opencraft.cc-gateway.<profile>` (`~/Library/LaunchAgents`), systemd template `cc-gateway@.service` with one instance `cc-gateway@<profile>` per profile. `--all`: launchd `dev.opencraft.cc-gateway.all` / systemd `cc-gateway-all.service`, logs in `~/.cc-gateway/logs/`. Installing `--all` is refused while per-profile units exist (and vice versa), since both would poll the same bots. The profile name `all` is reserved.
+
+`run --all` starts every profile that has a gateway enabled; each keeps its own state, queues, locks and session owners. A profile that fails (bad token, port in use) is logged and the others keep running; a profile with the same Telegram token as an earlier one is skipped. The process-wide claude cap is the smallest `max_concurrent_runs` among them. Logs go to one file, `~/.cc-gateway/logs/bot.log`; lines carry the profile name where it is known.
 
 `profile create` checks the token with `getMe`, writes a default `SOUL.md`, and prints the bot's @username. Tip shown to the user: send `/start` to the bot and copy your user id from the "not allowed" log line, or use @userinfobot.
 
@@ -169,6 +180,7 @@ max_turns = 30                    # --max-turns
 run_timeout_secs = 900            # kill claude after this
 claude_bin = "claude"             # path override
 extra_claude_args = []            # appended verbatim
+max_concurrent_runs = 2           # process-wide cap on concurrent claude runs (run --all: smallest wins)
 
 [voice]
 enabled = false                   # setup turns it on when ffmpeg + whisper-cli + model exist
@@ -276,9 +288,10 @@ Served by axum on `[api] bind`. Auth runs as middleware before any request body 
 
 ## Scheduling
 
-- `users/<uid>/schedules.json`: `[{ id, cron, prompt, chat_id, created_at }]`. 5-field cron, local timezone.
+- `users/<uid>/schedules.json`: `[{ id, cron, prompt, chat_id, created_at, every_minutes?, command?, cwd?, name?, enabled?, deliver? }]`. 5-field cron, local timezone (the process `TZ`). `every_minutes: N` is due when the minute since the Unix epoch is a multiple of N. `enabled: false` jobs are kept but never run.
+- **Command jobs** (`command: [argv…]`, imported from Hermes `no_agent` script jobs): run directly, no shell and no claude, in `workspace/<cwd>` in their own process group, killed after `run_timeout_secs`; stdout/stderr capped at 1 MB each; a job still running when it comes due again is skipped (logged). Output like Hermes: stdout posted to `chat_id`; empty stdout or a last line `{"wakeAgent": false}` → silent; failure → `⚠ <name> failed` + output tail. `deliver: false` runs silently (failures logged). Command jobs don't take a claude run slot.
 - Use the `cron` crate. Every minute a single tokio task checks all jobs across users.
-- A due job goes onto **that chat's queue** like a normal message, but runs **without `--resume`** (a fresh session, so cron runs don't pollute the chat context). Memory + soul still get injected. The output is posted to `chat_id`, prefixed `⏰ <prompt snippet>`.
+- A due prompt job goes onto **that chat's queue** like a normal message, but runs **without `--resume`** (a fresh session, so cron runs don't pollute the chat context). Memory + soul still get injected. The output is posted to `chat_id`, prefixed `⏰ <prompt snippet>`.
 - Missed runs while the bot was down are skipped, not backfilled.
 
 ## Rust crates
@@ -330,6 +343,10 @@ src/state.rs       # state.json atomic persistence
 - [ ] Missing/bad/revoked keys get 401 in OpenAI error shape; over `max_concurrent` gets 429
 - [ ] `X-CC-Session` continues a conversation; every response returns the session id
 - [ ] `DELETE /v1/runs/{id}` stops a running native run; binding to a non-loopback address prints a warning
+- [ ] Importing a real Hermes server profile allowlists approved pairings + the home-channel owner without a `TELEGRAM_ALLOWED_USERS`; allow-all imports the owner only; Discord-only profiles are skipped with a clear line
+- [ ] Hermes cron jobs arrive as schedules (script jobs as command jobs with their scripts copied; paused ones disabled); re-importing doesn't duplicate them
+- [ ] With `max_concurrent_runs = 2`, a third message waits and shows `⏳ queued (n ahead)`
+- [ ] `run --all` serves every profile in one process; one profile's 409 or bad token doesn't stop the others; `service install --all` refuses while per-profile units exist
 
 ## Out of scope (v1)
 

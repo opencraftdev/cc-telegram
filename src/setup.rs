@@ -1,8 +1,9 @@
 //! Setup wizard, doctor, pairing, update/uninstall and other interactive CLI flows.
 
+use crate::hermes;
 use crate::media::which;
 use crate::profile::{self, Config, PairStore, Profile, expand_tilde};
-use crate::{hermes, service};
+use crate::service::{self, Target};
 use anyhow::{Context, Result, bail};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
@@ -43,6 +44,9 @@ pub struct SetupArgs {
     /// Don't offer to import Hermes Agent
     #[arg(long)]
     no_import_hermes: bool,
+    /// With --import-hermes: Hermes profile to import (repeatable; `root` = the top level)
+    #[arg(long, value_name = "NAME", requires = "import_hermes")]
+    only: Vec<String>,
     /// Enable the HTTP API gateway and create a key named "default" (printed once)
     #[arg(long)]
     api: bool,
@@ -110,7 +114,7 @@ pub async fn setup(a: SetupArgs) -> Result<()> {
     if !a.no_import_hermes
         && let Some(home) = hermes::detect()
     {
-        let imported = import_hermes(&home, a.profile.clone(), true, false, None).await?;
+        let imported = import_hermes(&home, a.profile.clone(), true, false, None, &[]).await?;
         if !imported.is_empty() {
             for (p, bot_name) in imported {
                 let cfg = p.load_config()?;
@@ -291,7 +295,7 @@ async fn finish_profile(p: &Profile, mut cfg: Config, bot_name: Option<&str>) ->
         .default(true)
         .interact()?;
     if service {
-        match service::install(p) {
+        match service::install(&Target::Profile(p.name.clone())) {
             Ok(()) => ok("service installed and running"),
             Err(e) => bad(format!("{e:#}")),
         }
@@ -457,10 +461,19 @@ async fn non_interactive(a: SetupArgs) -> Result<()> {
         let Some(home) = hermes::detect() else {
             bail!("✗ no Hermes Agent found (looked at $HERMES_HOME and ~/.hermes)");
         };
-        let imported =
-            import_hermes(&home, a.profile.clone(), false, false, a.token.clone()).await?;
+        let imported = import_hermes(
+            &home,
+            a.profile.clone(),
+            false,
+            false,
+            a.token.clone(),
+            &a.only,
+        )
+        .await?;
         if imported.is_empty() {
-            bail!("✗ nothing imported → run: cc-gateway setup");
+            bail!(
+                "✗ nothing imported → pick Hermes profiles: cc-gateway setup --import-hermes --only <name>"
+            );
         }
         for (p, bot_name) in imported {
             let mut cfg = p.load_config()?;
@@ -474,7 +487,7 @@ async fn non_interactive(a: SetupArgs) -> Result<()> {
                 print_key(&p, "default", &key, &p.load_config()?);
             }
             if a.service {
-                service::install(&p)?;
+                service::install(&Target::Profile(p.name.clone()))?;
                 ok(format!("service installed and running for {}", p.name));
             } else {
                 println!("Start it with: cc-gateway run {}", p.name);
@@ -517,7 +530,7 @@ async fn non_interactive(a: SetupArgs) -> Result<()> {
         print_key(&p, "default", &key, &p.load_config()?);
     }
     if a.service {
-        service::install(&p)?;
+        service::install(&Target::Profile(p.name.clone()))?;
         ok("service installed and running");
     } else {
         println!("Start it with: cc-gateway run {name}");
@@ -613,6 +626,7 @@ pub async fn import_hermes(
     interactive: bool,
     yes: bool,
     token_override: Option<String>,
+    only: &[String],
 ) -> Result<Vec<(Profile, String)>> {
     let srcs = hermes::sources(home);
     if srcs.is_empty() {
@@ -628,8 +642,36 @@ pub async fn import_hermes(
             f.summary()
         );
     }
-    let ask = interactive && !yes;
+    let ask = interactive && !yes && only.is_empty();
+    let label = |s: &hermes::Source| s.name.clone().unwrap_or_else(|| "root".into());
+    // A path straight to one Hermes profile dir is an explicit choice.
+    let single_profile = srcs.len() == 1 && srcs[0].name.is_some();
     let mut chosen: Vec<usize> = (0..srcs.len()).collect();
+    if !only.is_empty() {
+        let names: Vec<String> = srcs.iter().map(label).collect();
+        if let Some(bad_name) = only.iter().find(|o| !names.contains(o)) {
+            bail!(
+                "✗ no Hermes profile {bad_name:?} → choose from: {}",
+                names.join(", ")
+            );
+        }
+        chosen.retain(|i| only.contains(&names[*i]));
+    } else if !ask && !single_profile {
+        // Importing every profile non-interactively would start polling every live Hermes
+        // bot token at once (409 fights with the running gateways). Make the user pick.
+        println!(
+            "\nNothing imported: pick the profiles to move → run: cc-gateway import hermes --only <name> [--only <name> …]{}",
+            if srcs.len() > 1 {
+                format!(
+                    "  (available: {})",
+                    srcs.iter().map(label).collect::<Vec<_>>().join(", ")
+                )
+            } else {
+                String::new()
+            }
+        );
+        return Ok(vec![]);
+    }
     if ask {
         let go = Confirm::new()
             .with_prompt(format!(
@@ -642,14 +684,12 @@ pub async fn import_hermes(
             return Ok(vec![]);
         }
         if srcs.len() > 1 {
-            let labels: Vec<_> = srcs
-                .iter()
-                .map(|s| s.name.clone().unwrap_or_else(|| "(root)".into()))
-                .collect();
+            let labels: Vec<_> = srcs.iter().map(label).collect();
+            // Default: nothing selected. Each imported bot stops working in Hermes once
+            // cc-gateway polls it.
             chosen = dialoguer::MultiSelect::new()
-                .with_prompt("Which Hermes profiles? (space toggles, Enter confirms)")
+                .with_prompt("Which Hermes profiles? (space selects, Enter confirms)")
                 .items(&labels)
-                .defaults(&vec![true; labels.len()])
                 .interact()?;
         }
     }
@@ -672,6 +712,10 @@ pub async fn import_hermes(
         }
         let existing = profile::list().contains(&name);
         let mut rows: Vec<hermes::Row> = vec![];
+        if f.discord_only && !(src.name.is_none() && token_override.is_some()) {
+            println!("  Discord-only, skipped (Discord isn't supported by cc-gateway)");
+            continue;
+        }
 
         // Token: override (root) > Hermes .env > existing profile > ask.
         let candidate = match (&src.name, &token_override) {
@@ -702,21 +746,28 @@ pub async fn import_hermes(
             if ask {
                 token = Some(ask_token().await?);
             } else {
+                let fix = if src.name.is_none() {
+                    "cc-gateway setup --token <TOKEN> --import-hermes"
+                } else {
+                    "cc-gateway import hermes  (interactively; paste a token from @BotFather when asked)"
+                };
                 bad(format!(
-                    "skipped {name}: no valid bot token → run: cc-gateway setup --token <TOKEN> --import-hermes"
+                    "skipped {name}: {} → run: {fix}",
+                    if f.token.is_none() {
+                        "no Telegram bot token in Hermes"
+                    } else {
+                        "no valid bot token"
+                    }
                 ));
                 continue;
             }
         }
         let (token, bot_name) = token.unwrap();
         if from_hermes {
+            let stop = hermes_stop_hint(src.name.as_deref());
             println!(
-                "{} this bot token is also Hermes's. If its gateway is running, both poll Telegram → 409 Conflict.\n   Stop it → run: hermes gateway stop{}  (or create a new bot with @BotFather)",
+                "{} this bot token is also Hermes's. If its gateway is running, both poll Telegram → 409 Conflict.\n   Stop it → run: {stop}  (or create a new bot with @BotFather)",
                 style("⚠").yellow().bold(),
-                src.name
-                    .as_ref()
-                    .map(|n| format!("  (profile: hermes -p {n} gateway stop)"))
-                    .unwrap_or_default()
             );
         }
 
@@ -753,6 +804,26 @@ pub async fn import_hermes(
             "allowed users".into(),
             format!("{} added", cfg.allowed_user_ids.len() - before),
         ));
+        if f.allow_all {
+            rows.push((
+                "".into(),
+                if f.owner.is_some() {
+                    "⚠ Hermes allowed every Telegram user; only the owner was imported → add others: cc-gateway pair / allow".into()
+                } else {
+                    format!("⚠ Hermes allowed every Telegram user and no owner was found: allowlist empty → pair with: cc-gateway pair {name}")
+                },
+            ));
+        }
+        if f.dropped_ids > 0 {
+            rows.push((
+                "".into(),
+                format!(
+                    "note: {} non-numeric allowlist entr{} (e.g. usernames) dropped; cc-gateway needs numeric user ids",
+                    f.dropped_ids,
+                    if f.dropped_ids == 1 { "y" } else { "ies" }
+                ),
+            ));
+        }
         rows.push((
             "model".into(),
             match f.model.as_deref().map(|m| (m, hermes::map_model(m))) {
@@ -776,8 +847,9 @@ pub async fn import_hermes(
             None => Profile::create(&name, &cfg)?,
         };
 
-        // Hermes memory has one owner.
+        // Hermes memory has one owner: the home channel's user, else the single allowed user.
         let owner = match f.allowed.as_slice() {
+            _ if f.owner.is_some() => f.owner,
             [] => None,
             [one] => Some(*one),
             many if ask => {
@@ -806,6 +878,7 @@ pub async fn import_hermes(
                     .unwrap_or(false))
         };
         rows.extend(hermes::import_files(f, &p, owner, &mut confirm));
+        rows.extend(hermes::import_jobs(f, &p, owner, &mut confirm));
         if owner.is_none() && (f.memory.is_some() || f.user.is_some()) {
             rows.push((
                 "memory owner".into(),
@@ -818,6 +891,23 @@ pub async fn import_hermes(
         out.push((p, bot_name));
     }
     Ok(out)
+}
+
+/// How to stop the Hermes gateway that polls an imported token.
+fn hermes_stop_hint(profile: Option<&str>) -> String {
+    match profile {
+        Some(n) => {
+            let unit = format!("hermes-gateway-{n}.service");
+            let has_unit = cfg!(target_os = "linux")
+                && dirs::config_dir().is_some_and(|d| d.join("systemd/user").join(&unit).exists());
+            if has_unit {
+                format!("systemctl --user stop {unit} && systemctl --user disable {unit}")
+            } else {
+                format!("hermes -p {n} gateway stop")
+            }
+        }
+        None => "hermes gateway stop".into(),
+    }
 }
 
 // ---------- pair / profile helpers ----------
@@ -872,7 +962,7 @@ pub fn delete(p: &Profile) -> Result<()> {
         .default(false)
         .interact()?;
     if sure {
-        service::uninstall(&p.name)?;
+        service::uninstall(&Target::Profile(p.name.clone()))?;
         std::fs::remove_dir_all(&p.dir)?;
         ok(format!("deleted {}", p.name));
     }
@@ -891,18 +981,22 @@ pub fn update() -> Result<()> {
     }
     for n in profile::list()
         .into_iter()
-        .filter(|n| service::is_installed(n))
+        .filter(|n| service::is_installed(&Target::Profile(n.clone())))
     {
         println!("Restart {n} to use the new version: cc-gateway service install {n}");
+    }
+    if service::is_installed(&Target::All) {
+        println!("Restart it to use the new version: cc-gateway service install --all");
     }
     Ok(())
 }
 
 pub fn uninstall() -> Result<()> {
     for n in profile::list() {
-        service::uninstall(&n)?;
+        service::uninstall(&Target::Profile(n.clone()))?;
         ok(format!("service removed: {n}"));
     }
+    service::uninstall(&Target::All)?;
     let home = profile::home();
     if home.exists()
         && Confirm::new()
@@ -1030,7 +1124,8 @@ pub async fn doctor() -> Result<()> {
             );
         }
         check(
-            service::is_running(name),
+            service::is_running(&Target::Profile(name.clone()))
+                || service::is_running(&Target::All),
             "service running".into(),
             &format!("run: cc-gateway service install {name}"),
         );

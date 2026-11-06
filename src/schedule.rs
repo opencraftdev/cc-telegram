@@ -10,14 +10,66 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Sched {
     pub id: u32,
+    /// 5-field cron; empty when `every_minutes` is used.
+    #[serde(default)]
     pub cron: String,
+    /// Interval schedule: due when the minute since the Unix epoch is a multiple of this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_minutes: Option<u32>,
+    #[serde(default)]
     pub prompt: String,
+    /// Command job: argv run directly (no shell, no claude) instead of `prompt`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Command working directory, relative to the profile workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub chat_id: i64,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// Post the output to `chat_id` (false = run silently; failures are still logged).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub deliver: bool,
     pub created_at: String,
+}
+
+fn yes() -> bool {
+    true
+}
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+impl Sched {
+    pub fn is_due<Z: TimeZone>(&self, at: DateTime<Z>) -> bool {
+        self.enabled
+            && match self.every_minutes {
+                Some(m) => m > 0 && (at.timestamp() / 60) % i64::from(m) == 0,
+                None => due(&self.cron, at),
+            }
+    }
+
+    /// One line for /schedules.
+    pub fn describe(&self) -> String {
+        let when = match self.every_minutes {
+            Some(m) => format!("every {m}m"),
+            None => format!("`{}`", self.cron),
+        };
+        let what = if self.command.is_empty() {
+            crate::runner::truncate(&self.prompt, 60)
+        } else {
+            format!("$ {}", crate::runner::truncate(&self.command.join(" "), 60))
+        };
+        let off = if self.enabled { "" } else { " (disabled)" };
+        format!("#{} {when} → {what}{off}", self.id)
+    }
 }
 
 const DAYS: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -119,14 +171,37 @@ fn save(profile: &Profile, uid: u64, list: &[Sched]) -> Result<()> {
 
 pub fn add(profile: &Profile, uid: u64, chat_id: i64, cron: &str, prompt: &str) -> Result<Sched> {
     parse_cron(cron)?;
-    let mut list = load(profile, uid);
     let s = Sched {
-        id: list.iter().map(|s| s.id).max().unwrap_or(0) + 1,
         cron: cron.split_whitespace().collect::<Vec<_>>().join(" "),
         prompt: prompt.to_string(),
-        chat_id,
-        created_at: Local::now().to_rfc3339(),
+        ..Sched::new(chat_id)
     };
+    push(profile, uid, s)
+}
+
+impl Sched {
+    /// An enabled, delivering job with no schedule/body yet (id assigned by `push`).
+    pub fn new(chat_id: i64) -> Self {
+        Self {
+            id: 0,
+            cron: String::new(),
+            every_minutes: None,
+            prompt: String::new(),
+            command: vec![],
+            cwd: None,
+            name: None,
+            chat_id,
+            enabled: true,
+            deliver: true,
+            created_at: Local::now().to_rfc3339(),
+        }
+    }
+}
+
+/// Append a job with the next free id.
+pub fn push(profile: &Profile, uid: u64, mut s: Sched) -> Result<Sched> {
+    let mut list = load(profile, uid);
+    s.id = list.iter().map(|s| s.id).max().unwrap_or(0) + 1;
     list.push(s.clone());
     save(profile, uid, &list)?;
     Ok(s)
@@ -141,6 +216,137 @@ pub fn remove(profile: &Profile, uid: u64, id: u32) -> Result<bool> {
     }
     save(profile, uid, &list)?;
     Ok(true)
+}
+
+/// Hermes-compatible output handling for command jobs: failure → alert with the output tail;
+/// empty stdout or a last line `{"wakeAgent": false}` → nothing; otherwise stdout.
+pub fn command_message(name: &str, ok: bool, stdout: &str, stderr: &str) -> Option<String> {
+    if !ok {
+        let all = format!("{}\n{}", stdout.trim(), stderr.trim());
+        let all = all.trim();
+        let tail: String = {
+            let chars: Vec<char> = all.chars().collect();
+            chars[chars.len().saturating_sub(3000)..].iter().collect()
+        };
+        return Some(format!("⚠ {name} failed\n\n{tail}"));
+    }
+    let out = stdout.trim();
+    let silent = out
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| {
+            serde_json::from_str::<serde_json::Value>(l.trim())
+                .is_ok_and(|v| v.get("wakeAgent") == Some(&serde_json::Value::Bool(false)))
+        });
+    (!out.is_empty() && !silent).then(|| out.to_string())
+}
+
+/// Max bytes kept from each of stdout/stderr; the rest is read and discarded.
+pub const OUTPUT_CAP: u64 = 1024 * 1024;
+
+async fn read_capped(r: Option<impl tokio::io::AsyncRead + Unpin>) -> String {
+    use tokio::io::AsyncReadExt;
+    let Some(mut r) = r else {
+        return String::new();
+    };
+    let mut buf = vec![];
+    let _ = (&mut r).take(OUTPUT_CAP).read_to_end(&mut buf).await;
+    let _ = tokio::io::copy(&mut r, &mut tokio::io::sink()).await; // keep the pipe drained
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Run argv (no shell) in `cwd` in its own process group; kill the group on timeout.
+/// Returns (success, stdout, stderr), each output capped at `OUTPUT_CAP`.
+pub async fn exec(
+    argv: &[String],
+    cwd: &std::path::Path,
+    timeout: Duration,
+) -> (bool, String, String) {
+    let child = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                false,
+                String::new(),
+                format!("could not start {:?}: {e}", argv[0]),
+            );
+        }
+    };
+    let pid = child.id();
+    let (out, err) = (child.stdout.take(), child.stderr.take());
+    let run = async {
+        let (o, e, st) = tokio::join!(read_capped(out), read_capped(err), child.wait());
+        (st.is_ok_and(|s| s.success()), o, e)
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Ok(r) => r,
+        Err(_) => {
+            crate::runner::kill_group(pid);
+            (
+                false,
+                String::new(),
+                format!("timed out after {}s", timeout.as_secs()),
+            )
+        }
+    }
+}
+
+/// Command jobs currently running (profile dir, user, job id): a job still running when it
+/// comes due again is skipped, not started twice.
+static RUNNING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Claims `key` until dropped; None if it's already running.
+struct Running(String);
+impl Running {
+    fn claim(key: String) -> Option<Self> {
+        let mut r = RUNNING.lock().unwrap();
+        if r.contains(&key) {
+            return None;
+        }
+        r.push(key.clone());
+        Some(Self(key))
+    }
+}
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.lock().unwrap().retain(|k| *k != self.0);
+    }
+}
+
+/// Run a command job in the workspace with a timeout; post its output.
+async fn run_command(app: &App, uid: u64, s: &Sched, timeout: Duration) {
+    let key = format!("{}:{uid}:{}", app.profile.dir.display(), s.id);
+    let Some(_running) = Running::claim(key) else {
+        tracing::warn!(
+            id = s.id,
+            "command job still running from its last run; skipped"
+        );
+        return;
+    };
+    let name = s
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("schedule #{}", s.id));
+    let cwd = app.profile.workspace().join(s.cwd.as_deref().unwrap_or(""));
+    let (ok, stdout, stderr) = exec(&s.command, &cwd, timeout).await;
+    tracing::info!(id = s.id, ok, "command job finished");
+    match command_message(&name, ok, &stdout, &stderr) {
+        Some(msg) if s.deliver => {
+            crate::bot::send_long(&app.bot, teloxide::types::ChatId(s.chat_id), &msg).await
+        }
+        Some(msg) if !ok => tracing::warn!(id = s.id, "{msg}"),
+        _ => {}
+    }
 }
 
 /// Every minute, enqueue due jobs of allowlisted users onto their chat's queue.
@@ -166,9 +372,14 @@ pub async fn run_loop(app: Arc<App>) {
             }
             for s in load(&app.profile, uid)
                 .into_iter()
-                .filter(|s| due(&s.cron, tick))
+                .filter(|s| s.is_due(tick))
             {
                 tracing::info!(user_id = uid, id = s.id, "running schedule");
+                if !s.command.is_empty() {
+                    let (app, timeout) = (app.clone(), Duration::from_secs(cfg.run_timeout_secs));
+                    tokio::spawn(async move { run_command(&app, uid, &s, timeout).await });
+                    continue;
+                }
                 crate::bot::enqueue(
                     &app,
                     Job {
@@ -232,6 +443,43 @@ mod tests {
     }
 
     #[test]
+    fn interval_disabled_and_old_json() {
+        let mut s = Sched::new(1);
+        s.every_minutes = Some(5);
+        assert!(s.is_due(at(2026, 11, 6, 10, 15)));
+        assert!(!s.is_due(at(2026, 11, 6, 10, 16)));
+        s.enabled = false;
+        assert!(!s.is_due(at(2026, 11, 6, 10, 15)));
+        // schedules.json written before these fields existed still loads
+        let old: Sched = serde_json::from_str(
+            r#"{"id":1,"cron":"*/5 * * * *","prompt":"hi","chat_id":7,"created_at":"x"}"#,
+        )
+        .unwrap();
+        assert!(old.enabled && old.deliver && old.command.is_empty());
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("enabled") && !json.contains("command"));
+    }
+
+    #[test]
+    fn command_output_like_hermes() {
+        assert_eq!(
+            command_message("j", true, "  report\n", ""),
+            Some("report".into())
+        );
+        assert_eq!(command_message("j", true, "  \n", ""), None);
+        assert_eq!(
+            command_message("j", true, "x\n{\"wakeAgent\": false}\n", ""),
+            None
+        );
+        assert_eq!(
+            command_message("j", true, "{\"wakeAgent\": true}", ""),
+            Some("{\"wakeAgent\": true}".into())
+        );
+        let fail = command_message("j", false, "partial", "Traceback: boom").unwrap();
+        assert!(fail.starts_with("⚠ j failed") && fail.contains("boom"));
+    }
+
+    #[test]
     fn dow_conversion() {
         assert_eq!(convert_dow("*").unwrap(), "*");
         assert_eq!(convert_dow("0").unwrap(), "1");
@@ -241,5 +489,47 @@ mod tests {
         assert_eq!(convert_dow("mon,wed").unwrap(), "2,4");
         assert!(convert_dow("5-3").is_err());
         assert!(convert_dow("*/0").is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_runs_argv_without_shell_and_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.sh"), "echo \"$1\"; pwd").unwrap();
+        let argv: Vec<String> = ["sh", "s.sh", "a; rm -rf /"].map(String::from).into();
+        let (ok, out, _) = exec(&argv, dir.path(), Duration::from_secs(5)).await;
+        assert!(ok);
+        assert!(out.starts_with("a; rm -rf /\n"), "{out}");
+        let slow: Vec<String> = ["sh", "-c", "sleep 30"].map(String::from).into();
+        let t = std::time::Instant::now();
+        let (ok, _, err) = exec(&slow, dir.path(), Duration::from_millis(300)).await;
+        assert!(!ok && err.contains("timed out") && t.elapsed() < Duration::from_secs(5));
+        let (ok, _, err) = exec(
+            &["/nonexistent".to_string()],
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(!ok && err.contains("could not start"));
+        // huge output is capped, and the process still finishes (pipe drained)
+        let big: Vec<String> = [
+            "sh",
+            "-c",
+            "head -c 3000000 /dev/zero | tr '\\0' x; echo done >&2",
+        ]
+        .map(String::from)
+        .into();
+        let (ok, out, err) = exec(&big, dir.path(), Duration::from_secs(20)).await;
+        assert!(ok, "{err}");
+        assert_eq!(out.len() as u64, OUTPUT_CAP);
+        assert_eq!(err.trim(), "done");
+    }
+
+    #[test]
+    fn overlapping_runs_are_refused() {
+        let a = Running::claim("p:1:9".into()).unwrap();
+        assert!(Running::claim("p:1:9".into()).is_none());
+        assert!(Running::claim("p:1:10".into()).is_some());
+        drop(a);
+        assert!(Running::claim("p:1:9".into()).is_some());
     }
 }

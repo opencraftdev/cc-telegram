@@ -44,8 +44,8 @@ cc-gateway setup --token "$BOT_TOKEN" --profile work --model sonnet --api --serv
 # API only (no Telegram token)
 cc-gateway setup --api --profile api
 
-# Import a Hermes Agent install
-cc-gateway setup --import-hermes
+# Import one Hermes Agent profile
+cc-gateway setup --import-hermes --only <hermes-profile>
 ```
 
 | Flag | Meaning |
@@ -58,6 +58,7 @@ cc-gateway setup --import-hermes
 | `--no-voice` | Don't enable voice notes. |
 | `--import-hermes` | Import a detected Hermes Agent install. Turns on non-interactive mode. |
 | `--no-import-hermes` | Don't offer the Hermes import in the wizard. |
+| `--only <NAME>` | With `--import-hermes`: the Hermes profile to import (repeatable; `root` = top level). Required: without it nothing is imported. |
 
 `--model`, `--service` and `--no-voice` only apply in non-interactive mode, that is together with `--token`, `--api` or `--import-hermes`; the interactive wizard asks instead. In non-interactive mode a Telegram profile gets a `/pair <code>` to send to the bot instead of the 2-minute Start window.
 

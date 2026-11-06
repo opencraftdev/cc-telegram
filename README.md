@@ -58,8 +58,8 @@ See [docs/api.md](docs/api.md).
 - [Telegram gateway](docs/telegram.md): commands, pairing, media, schedules
 - [API gateway](docs/api.md): auth, endpoints, OpenAI SDK examples, streaming, sessions, native runs
 - [Configuration](docs/configuration.md): full `config.toml` reference
-- [Profiles and background service](docs/profiles-and-service.md)
-- [Importing from Hermes Agent](docs/hermes-import.md)
+- [Profiles and background service](docs/profiles-and-service.md): including `run --all`, which runs every profile in one process with a shared cap on concurrent claude runs (good for small servers)
+- [Importing from Hermes Agent](docs/hermes-import.md): bot tokens, allowlists and pairings, memory, skills and cron jobs
 - [Security](docs/security.md)
 - [Architecture](docs/architecture.md)
 - [Troubleshooting](docs/troubleshooting.md)

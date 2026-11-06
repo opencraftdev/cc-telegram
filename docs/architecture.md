@@ -31,7 +31,7 @@ flowchart LR
 
 | File | Role |
 |------|------|
-| `main.rs` | clap CLI, home migration, `run` (starts the gateways, signal handling), logging |
+| `main.rs` | clap CLI, home migration, `run <profile>` / `run --all` (gateways, global run cap, signal handling), logging |
 | `bot.rs` | Telegram gateway: dispatcher, allowlist gate, chat commands, job execution, MarkdownV2, outbox, 409 hint |
 | `api.rs` | API gateway: axum routes, key generation/hashing, OpenAI request/response mapping, SSE, run registry |
 | `runner.rs` | Spawn claude, parse stream-json, timeout/stop, process-group kill, shutdown kill-all |
@@ -40,13 +40,16 @@ flowchart LR
 | `profile.rs` | Paths, `config.toml` (0600, atomic), profile lock, pair codes, migration |
 | `state.rs` | `state.json` atomic persistence, compare-and-set session storage, `sessions.json` session owners |
 | `media.rs` | Telegram downloads, ffmpeg + whisper-cli transcription |
-| `schedule.rs` | 5-field cron (standard weekday numbering, dom/dow OR), minute loop |
-| `service.rs` | launchd plist / systemd template unit |
+| `schedule.rs` | 5-field cron (standard weekday numbering, dom/dow OR), interval jobs, command jobs, minute loop |
+| `service.rs` | launchd plist / systemd units, per profile or `--all` |
 | `setup.rs` | Wizard, non-interactive setup, doctor, keys, pair, Hermes import flow, update/uninstall |
-| `hermes.rs` | Hermes home detection, `.env`/`config.yaml` parsing, file and skill import |
+| `hermes.rs` | Hermes home detection, `.env`/`config.yaml` parsing, allowlist/owner derivation, file, skill and cron import |
 
 ## Concurrency and safety details
 
 - `config.toml` and `pair.json` read-modify-writes, in both the daemon and the CLI, hold an exclusive `flock` on `<profile>/.lock`. Writes use unique temp files followed by an atomic rename.
 - The API authenticates in middleware (before reading the body) and re-reads `config.toml` for every request (keys); Telegram re-reads it for every message (allowlist).
 - Each claude process group id is tracked; SIGTERM or SIGINT kills them all before exit.
+- A process-wide semaphore (`max_concurrent_runs`) caps concurrent claude processes across every profile and gateway; `/stop` and client disconnects also cancel a run that is still waiting for a slot.
+- `run --all` runs each profile's gateways as an independent task (own state, queues, locks, session owners); a failing profile is logged and doesn't stop the others.
+- Command jobs (`schedules.json` `command`) run argv directly in their own process group with a timeout, outside the claude cap.

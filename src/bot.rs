@@ -93,9 +93,11 @@ pub async fn run(profile: Profile, queues: Arc<Queues>, owners: Arc<SessionOwner
 /// Telegram 409: another process (often a Hermes gateway) polls with the same token.
 pub fn conflict_hint(profile: &str) -> String {
     format!(
-        "✗ Telegram 409 Conflict: another bot instance is polling with this token. If it's Hermes \
-         Agent, stop its gateway → run: hermes gateway stop (or: hermes -p <name> gateway stop); \
-         or give profile {profile} its own bot → run: cc-gateway profile edit {profile}"
+        "✗ [{profile}] Telegram 409 Conflict: another process is polling this bot token (retrying \
+         with backoff). If it's Hermes Agent, its unit is likely hermes-gateway-{profile}.service \
+         → run: systemctl --user disable --now hermes-gateway-{profile}.service (or: hermes -p \
+         {profile} gateway stop); or give profile {profile} its own bot → run: cc-gateway profile \
+         edit {profile}"
     )
 }
 
@@ -300,7 +302,7 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
                     "No schedules.".into()
                 } else {
                     list.iter()
-                        .map(|s| format!("#{} `{}` → {}", s.id, s.cron, truncate(&s.prompt, 60)))
+                        .map(|s| s.describe())
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
@@ -389,7 +391,14 @@ async fn try_run_job(app: &Arc<App>, job: &Job, stop: Arc<Notify>) -> Result<()>
     };
     let status = app
         .bot
-        .send_message(chat, format!("{header}⏳ working…"))
+        .send_message(
+            chat,
+            match runner::slots().queued_ahead() {
+                // all global run slots busy: say so instead of looking stuck
+                Some(n) => format!("{header}⏳ queued ({n} ahead)"),
+                None => format!("{header}⏳ working…"),
+            },
+        )
         .await
         .ok()
         .map(|m| m.id);
@@ -519,6 +528,7 @@ async fn run_with_status(
                         if lines.len() > 10 { lines.remove(0); }
                         dirty = true;
                     }
+                    Some(runner::Event::Init(_)) => dirty = true, // started: drop "queued"
                     Some(_) => {}
                     None => break,
                 },
@@ -562,7 +572,7 @@ async fn send_text(
     }
 }
 
-async fn send_long(bot: &Bot, chat: ChatId, text: &str) {
+pub async fn send_long(bot: &Bot, chat: ChatId, text: &str) {
     for chunk in split_message(text, 4096) {
         let md = to_markdown_v2(&chunk);
         let res = if utf16_len(&md) <= 4096 {

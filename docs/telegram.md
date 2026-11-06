@@ -37,10 +37,11 @@ Any other text, including unknown `/commands`, goes to Claude as a prompt.
 ## How a message runs
 
 1. Each chat has its own FIFO queue, so messages in one chat run one at a time and different chats run in parallel.
-2. A status message shows `⏳ working…` and the latest tool steps (`🔧 Bash: ls`). It updates at most every 1.5 s. The bot sends "typing…" every 4 s while Claude works.
-3. The answer arrives as a new message, split at Telegram's 4096-character limit. Markdown is converted to MarkdownV2; if Telegram rejects the formatting, the bot sends plain text. The status message ends up as `✅ done · $0.04 · 12s`.
-4. The session id is saved per chat, so the next message continues the conversation (`--resume`). If the saved session is gone, the bot starts a new one and tells you.
-5. A run that exceeds `run_timeout_secs` is killed and you get `⏱️ timed out after Ns`.
+2. Every profile in the process shares a cap on concurrent claude runs (`max_concurrent_runs`, default 2). If all slots are busy, the status message says `⏳ queued (n ahead)` until a slot frees up. `/stop` also cancels a queued job.
+3. A status message shows `⏳ working…` and the latest tool steps (`🔧 Bash: ls`). It updates at most every 1.5 s. The bot sends "typing…" every 4 s while Claude works.
+4. The answer arrives as a new message, split at Telegram's 4096-character limit. Markdown is converted to MarkdownV2; if Telegram rejects the formatting, the bot sends plain text. The status message ends up as `✅ done · $0.04 · 12s`.
+5. The session id is saved per chat, so the next message continues the conversation (`--resume`). If the saved session is gone, the bot starts a new one and tells you.
+6. A run that exceeds `run_timeout_secs` is killed and you get `⏱️ timed out after Ns`.
 
 ## Memory
 
@@ -67,6 +68,20 @@ All users of a profile share its `SOUL.md`. Each user has their own `users/<id>/
 - Jobs are stored in `users/<uid>/schedules.json`. Due jobs go onto that chat's queue.
 - Scheduled runs use a **fresh session**, not the chat's, so they don't clutter your conversation. Memory and SOUL.md still apply. Output starts with `⏰ <prompt snippet>`.
 - Runs missed while the bot was down are skipped, not caught up.
+- `/schedules` lists every job: `#3 \`0 9 * * 1-5\` → summarize…`, `#4 every 5m → $ bash check.sh (disabled)`.
+
+`schedules.json` can also hold jobs you can't create from chat (the Hermes import writes them):
+
+| Field | Meaning |
+|-------|---------|
+| `every_minutes` | Interval instead of `cron`; due when the minute since the Unix epoch is a multiple of it |
+| `command` | argv run directly (no shell, no claude) in `workspace/<cwd>`. stdout is posted; empty output or a last line `{"wakeAgent": false}` stays silent; a failure posts `⚠ <name> failed` with the output tail. Killed after `run_timeout_secs`; output capped at 1 MB; a run that is still going when the job comes due again is skipped. |
+| `cwd` | Working directory for `command`, relative to the workspace |
+| `name` | Label used in failure messages |
+| `enabled` | `false` keeps the job without running it |
+| `deliver` | `false` runs it without posting output |
+
+Edit the file directly to change these; `/unschedule <id>` removes any job.
 
 ## 409 Conflict
 
