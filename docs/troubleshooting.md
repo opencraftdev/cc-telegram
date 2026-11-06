@@ -13,12 +13,13 @@ Logs: `~/.cc-gateway/profiles/<profile>/logs/bot.log`. On macOS, `logs/service.l
 ## Telegram 409 Conflict
 
 ```
-✗ Telegram 409 Conflict: another bot instance is polling with this token…
+✗ [<profile>] Telegram 409 Conflict: another process is polling this bot token (retrying with backoff). If it's Hermes Agent, its unit is likely hermes-gateway-<profile>.service …
 ```
 
-Two processes are polling the same bot token. Common causes:
+Two processes are polling the same bot token. cc-gateway keeps retrying with backoff (up to about a minute between tries), and other profiles keep working. Common causes:
 
-- A **Hermes Agent** gateway still runs with the same token: `hermes gateway stop`, or `hermes -p <name> gateway stop` for a Hermes profile.
+- A **Hermes Agent** gateway still runs with the same token: `systemctl --user disable --now hermes-gateway-<name>.service`, or `hermes -p <name> gateway stop` (`hermes gateway stop` for the root profile).
+- Both `cc-gateway service install --all` and a per-profile service: cc-gateway refuses to install one while the other exists; remove the extra one with `cc-gateway service uninstall <profile>` or `--all`.
 - `cc-gateway run <profile>` is running in a terminal while the service runs too: stop one (`cc-gateway service uninstall <profile>` or Ctrl-C).
 - Two cc-gateway profiles share one token: give each its own bot (`cc-gateway profile edit <profile>`).
 
@@ -32,6 +33,14 @@ Two processes are polling the same bot token. Common causes:
 Install Claude Code, run `claude` once to log in, then retry. If claude works in your terminal but the **service** can't find it, the service has an old `PATH`: run `cc-gateway service install <profile>` again from a shell where `which claude` works, or set `claude_bin` to the full path (`cc-gateway profile edit <profile>`).
 
 Telegram answers `✗ claude failed: … → run: cc-gateway doctor`; the API returns 500 `server_error` with the same text.
+
+## Can't reach Telegram (network)
+
+```
+✗ can't reach Telegram (network): …
+```
+
+The machine couldn't connect to api.telegram.org; this is different from a bad token. Setup, import and doctor retry 8 times over about a minute; the running bot retries forever (backing off to 5 minutes) instead of exiting, and long polling rides out network errors on its own. cc-gateway also tries Telegram's fallback addresses (149.154.166.110, 149.154.167.220) after the DNS answer, like Hermes. The import keeps a Hermes token it couldn't verify ("not verified — network").
 
 ## Token rejected
 
@@ -51,6 +60,14 @@ You're not on the allowlist. Check `logs/bot.log` for `not allowed: dropped mess
 - **429 `rate_limit_error`**: more than `[api] max_concurrent` requests are queued or running. Retry later or raise the limit (applies on restart).
 - **404 `session_not_found`**: the `X-CC-Session` / `session_id` wasn't created by this API key (sessions belong to the key that started them; Telegram sessions can't be resumed over the API), or Claude Code no longer has it. Drop the header to start a new session.
 - **Connection refused**: is the API enabled (`[api] enabled = true`) and the profile running? Check `cc-gateway service status <profile>`. If the port is taken, the log says `could not bind API to …`.
+
+## "⏳ queued (n ahead)"
+
+All `max_concurrent_runs` claude slots (default 2, shared by every profile in the process) are busy. The job starts when one frees up. Raise the value in `config.toml` if the machine has the RAM: each claude process uses roughly 200-400 MB.
+
+## Command job failed
+
+`⚠ <name> failed` followed by output: an imported Hermes script exited non-zero, timed out (`run_timeout_secs`) or couldn't start. Python scripts run with the system `python3`; install the packages they need, or point `command` in `users/<owner>/schedules.json` at another interpreter.
 
 ## "started a new session"
 

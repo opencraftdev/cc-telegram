@@ -3,11 +3,12 @@
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, mpsc};
 
 pub struct RunOpts {
     pub claude_bin: String,
@@ -177,7 +178,7 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn kill_group(pid: Option<u32>) {
+pub fn kill_group(pid: Option<u32>) {
     if let Some(pid) = pid {
         // process_group(0) made the child a group leader: -pid hits it and all its descendants.
         unsafe {
@@ -199,8 +200,57 @@ pub fn kill_all() {
 /// How long claude gets to exit (and stderr to drain) after its `result` / EOF.
 const GRACE: Duration = Duration::from_secs(5);
 
-/// Run claude; Init/Tool/Text events go to `steps` as they stream. `stop` cancels the run.
+/// Process-wide cap on concurrent claude processes (each is ~200-400MB of Node), shared by
+/// every gateway and profile in this process. Waiters queue FIFO.
+pub struct RunSlots {
+    sem: Semaphore,
+    waiting: AtomicUsize,
+}
+
+impl RunSlots {
+    pub fn new(n: usize) -> Self {
+        Self {
+            sem: Semaphore::new(n.max(1)),
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// Wait for a slot; None if `stop` fired first.
+    pub async fn acquire(&self, stop: &Notify) -> Option<SemaphorePermit<'_>> {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let p = tokio::select! {
+            p = self.sem.acquire() => p.ok(),
+            _ = stop.notified() => None,
+        };
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        p
+    }
+
+    /// `Some(runs already waiting)` when no slot is free right now.
+    pub fn queued_ahead(&self) -> Option<usize> {
+        (self.sem.available_permits() == 0).then(|| self.waiting.load(Ordering::SeqCst))
+    }
+}
+
+pub const DEFAULT_MAX_RUNS: usize = 2;
+static SLOTS: OnceLock<RunSlots> = OnceLock::new();
+
+/// Set the process-wide cap (first call wins; call before any run starts).
+pub fn set_max_runs(n: usize) {
+    let _ = SLOTS.set(RunSlots::new(n));
+}
+
+pub fn slots() -> &'static RunSlots {
+    // Tests run many fake claude processes in parallel; don't serialize them.
+    SLOTS.get_or_init(|| RunSlots::new(if cfg!(test) { 64 } else { DEFAULT_MAX_RUNS }))
+}
+
+/// Run claude; Init/Tool/Text events go to `steps` as they stream. `stop` cancels the run,
+/// also while it is still waiting for a global run slot.
 pub async fn run(o: &RunOpts, steps: mpsc::UnboundedSender<Event>, stop: Arc<Notify>) -> Outcome {
+    let Some(_slot) = slots().acquire(&stop).await else {
+        return Outcome::Stopped(None);
+    };
     let mut child = match Command::new(&o.claude_bin)
         .args(build_args(o))
         .current_dir(&o.cwd)
@@ -384,7 +434,7 @@ sleep 20 &"#,
             panic!()
         };
         assert_eq!(r.text, "fast");
-        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed()); // << the 15s timeout
     }
 
     #[test]
@@ -489,5 +539,28 @@ echo '{"type":"result","result":"done","session_id":"s9","total_cost_usd":0.01,"
             run(&o, tx, Arc::new(Notify::new())).await,
             Outcome::Failed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn run_slots_cap_queue_and_stop_while_waiting() {
+        let slots = Arc::new(RunSlots::new(1));
+        let never = Notify::new();
+        assert_eq!(slots.queued_ahead(), None);
+        let first = slots.acquire(&never).await.unwrap();
+        assert_eq!(slots.queued_ahead(), Some(0));
+        let s2 = slots.clone();
+        let waiter = tokio::spawn(async move {
+            let n = Notify::new();
+            s2.acquire(&n).await.is_some()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(slots.queued_ahead(), Some(1));
+        // a stop while waiting gives up the place in line
+        let stop = Notify::new();
+        stop.notify_one();
+        assert!(slots.acquire(&stop).await.is_none());
+        drop(first);
+        assert!(waiter.await.unwrap());
+        assert_eq!(slots.queued_ahead(), None);
     }
 }

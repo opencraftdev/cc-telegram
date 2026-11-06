@@ -541,7 +541,17 @@ fn start(
         )
     };
     let run_id = hex(&random_bytes(8).map_err(ise)?);
-    let system = crate::prompt::for_ns(&api.profile, &format!("key-{key}"), None).map_err(ise)?
+    let (cwd, cwd_args) = api.profile.claude_cwd(cfg);
+    let system = crate::prompt::assemble(
+        &api.profile,
+        &format!("key-{key}"),
+        crate::prompt::Channel::Api {
+            key: key.to_string(),
+        },
+        &cwd,
+        None,
+    )
+    .map_err(ise)?
         + system_extra;
     let opts = RunOpts {
         claude_bin: expand_tilde(&cfg.claude_bin).to_string_lossy().into(),
@@ -550,8 +560,8 @@ fn start(
         model: model.unwrap_or_else(|| cfg.default_model.clone()),
         max_turns: cfg.max_turns,
         resume: session.clone(),
-        extra_args: cfg.extra_claude_args.clone(),
-        cwd: api.profile.workspace(),
+        extra_args: [cwd_args, cfg.extra_claude_args.clone()].concat(),
+        cwd,
         timeout: Duration::from_secs(cfg.run_timeout_secs),
     };
     // Queued by session id alone, so one session never runs twice at once; new sessions

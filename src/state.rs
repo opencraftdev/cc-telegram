@@ -20,6 +20,9 @@ pub struct ChatState {
     /// Bumped by /new; a running job only saves its session if this is unchanged.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub epoch: u64,
+    /// Imported HISTORY.md was used once and a session now exists: never inject it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_done: bool,
 }
 
 fn is_zero(n: &u64) -> bool {

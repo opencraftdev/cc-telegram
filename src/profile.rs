@@ -32,6 +32,14 @@ pub struct Config {
     pub claude_bin: String,
     #[serde(default)]
     pub extra_claude_args: Vec<String>,
+    /// Process-wide cap on concurrent claude runs (Telegram + API + cron). With `run --all`
+    /// the smallest value among the profiles applies.
+    #[serde(default = "d_max_runs")]
+    pub max_concurrent_runs: usize,
+    /// Working directory for claude (e.g. Hermes' terminal.cwd). Default: the profile workspace.
+    /// The workspace is then added with --add-dir so its skills, inbox and outbox still work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
     #[serde(default)]
     pub voice: Voice,
     #[serde(default)]
@@ -106,6 +114,9 @@ fn d_max_turns() -> u32 {
 fn d_timeout() -> u64 {
     900
 }
+fn d_max_runs() -> usize {
+    crate::runner::DEFAULT_MAX_RUNS
+}
 fn d_claude() -> String {
     "claude".into()
 }
@@ -120,6 +131,8 @@ impl Config {
             run_timeout_secs: d_timeout(),
             claude_bin: d_claude(),
             extra_claude_args: vec![],
+            max_concurrent_runs: d_max_runs(),
+            workdir: None,
             voice: Voice::default(),
             api: Api::default(),
         }
@@ -227,6 +240,9 @@ pub fn validate_name(name: &str) -> Result<()> {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if !ok {
         bail!("✗ invalid profile name {name:?} → use letters, digits, '-' or '_'");
+    }
+    if name == "all" {
+        bail!("✗ \"all\" is reserved (cc-gateway run --all) → pick another profile name");
     }
     Ok(())
 }
@@ -364,6 +380,22 @@ impl Profile {
         Ok(ProfileLock(f))
     }
 
+    /// claude's cwd and the extra args it needs: `workdir` if set and present (plus
+    /// `--add-dir <workspace>`, which also makes claude load the workspace's skills),
+    /// else the workspace.
+    pub fn claude_cwd(&self, cfg: &Config) -> (PathBuf, Vec<String>) {
+        match cfg.workdir.as_deref().map(expand_tilde) {
+            Some(w) if w.is_dir() => (
+                w,
+                vec![
+                    "--add-dir".into(),
+                    self.workspace().to_string_lossy().into_owned(),
+                ],
+            ),
+            _ => (self.workspace(), vec![]),
+        }
+    }
+
     pub fn load_config(&self) -> Result<Config> {
         let path = self.config_path();
         let s = std::fs::read_to_string(&path)
@@ -483,6 +515,7 @@ mod tests {
         assert_eq!(c.default_model, "sonnet");
         assert_eq!(c.max_turns, 30);
         assert_eq!(c.run_timeout_secs, 900);
+        assert_eq!(c.max_concurrent_runs, 2);
         assert!(!c.voice.enabled);
         assert!(c.allowed_user_ids.is_empty());
         assert!(c.telegram_enabled() && !c.api.enabled);
@@ -525,9 +558,29 @@ mod tests {
     }
 
     #[test]
+    fn claude_cwd_uses_workdir_and_keeps_workspace_skills() {
+        let t = tempfile::tempdir().unwrap();
+        let p = Profile {
+            name: "t".into(),
+            dir: t.path().join("p"),
+        };
+        let mut c = Config::new(String::new());
+        assert_eq!(p.claude_cwd(&c), (p.workspace(), vec![]));
+        c.workdir = Some(t.path().display().to_string());
+        let (cwd, args) = p.claude_cwd(&c);
+        assert_eq!(cwd, t.path());
+        assert_eq!(
+            args,
+            vec!["--add-dir".to_string(), p.workspace().display().to_string()]
+        );
+        c.workdir = Some("/nonexistent/dir".into()); // gone: fall back to the workspace
+        assert_eq!(p.claude_cwd(&c).0, p.workspace());
+    }
+
+    #[test]
     fn names() {
         assert!(validate_name("work-2_a").is_ok());
-        for bad in ["", "../x", "a b", "a/b", "é"] {
+        for bad in ["", "../x", "a b", "a/b", "é", "all"] {
             assert!(validate_name(bad).is_err(), "{bad}");
         }
     }
