@@ -111,6 +111,49 @@ impl StateStore {
     }
 }
 
+/// sessions.json: Claude session id -> owner ("tg:<chat_id>" or "key:<api key name>").
+/// A session can only be resumed by its owner. Shared by both gateways of a profile.
+pub struct SessionOwners {
+    path: PathBuf,
+    inner: Mutex<HashMap<String, String>>,
+}
+
+impl SessionOwners {
+    pub fn open(path: PathBuf) -> Self {
+        let inner = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            inner: Mutex::new(inner),
+        }
+    }
+
+    pub fn owner(&self, session: &str) -> Option<String> {
+        self.inner.lock().unwrap().get(session).cloned()
+    }
+
+    /// Record `owner` for a session it created; never re-assigns someone else's session.
+    pub fn claim(&self, session: &str, owner: &str) -> bool {
+        let mut m = self.inner.lock().unwrap();
+        match m.get(session) {
+            Some(o) => o == owner,
+            None => {
+                m.insert(session.to_string(), owner.to_string());
+                if let Err(e) = atomic_write(
+                    &self.path,
+                    &serde_json::to_vec(&*m).unwrap_or_default(),
+                    0o600,
+                ) {
+                    tracing::error!("saving sessions.json: {e:#}");
+                }
+                true
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +198,19 @@ mod tests {
         // the next job sees the new epoch and may store
         assert!(store.set_session_if(7, store.get(7).epoch, "second".into()));
         assert_eq!(store.get(7).session_id.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn session_owners_persist_and_never_reassign() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let o = SessionOwners::open(path.clone());
+        assert!(o.claim("s1", "key:a"));
+        assert!(o.claim("s1", "key:a"));
+        assert!(!o.claim("s1", "tg:5"));
+        let o = SessionOwners::open(path);
+        assert_eq!(o.owner("s1").as_deref(), Some("key:a"));
+        assert_eq!(o.owner("s2"), None);
     }
 
     #[test]

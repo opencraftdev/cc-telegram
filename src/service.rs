@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn label(name: &str) -> String {
-    format!("dev.opencraft.cc-telegram.{name}")
+    format!("dev.opencraft.cc-gateway.{name}")
 }
 
 fn xml(s: &str) -> String {
@@ -56,10 +56,11 @@ fn systemd_quote(s: &str) -> String {
     )
 }
 
-pub fn unit(name: &str, exe: &Path, path_env: &str) -> String {
+/// Template unit `cc-gateway@.service`; one instance per profile: `cc-gateway@<profile>`.
+pub fn unit(exe: &Path, path_env: &str) -> String {
     format!(
-        "[Unit]\nDescription=cc-telegram bot ({name})\nAfter=network-online.target\n\n\
-         [Service]\nExecStart={} run {name}\nRestart=always\nRestartSec=5\nEnvironment={}\n\n\
+        "[Unit]\nDescription=cc-gateway (%i)\nAfter=network-online.target\n\n\
+         [Service]\nExecStart={} run %i\nRestart=always\nRestartSec=5\nEnvironment={}\n\n\
          [Install]\nWantedBy=default.target\n",
         systemd_quote(&exe.to_string_lossy()),
         systemd_quote(&format!("PATH={path_env}")),
@@ -73,11 +74,14 @@ fn plist_path(name: &str) -> PathBuf {
         .join(format!("{}.plist", label(name)))
 }
 
-fn unit_path(name: &str) -> PathBuf {
+fn unit_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_default()
-        .join("systemd/user")
-        .join(format!("cc-telegram-{name}.service"))
+        .join("systemd/user/cc-gateway@.service")
+}
+
+fn instance(name: &str) -> String {
+    format!("cc-gateway@{name}.service")
 }
 
 fn sh(cmd: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -133,12 +137,16 @@ pub fn install(profile: &Profile) -> Result<()> {
             );
         }
     } else if cfg!(target_os = "linux") {
-        let p = unit_path(name);
+        let p = unit_path();
         std::fs::create_dir_all(p.parent().unwrap())?;
-        std::fs::write(&p, unit(name, &exe, &path_env))?;
+        std::fs::write(&p, unit(&exe, &path_env))?;
         sh("systemctl", &["--user", "daemon-reload"])?;
-        let svc = format!("cc-telegram-{name}.service");
-        let out = sh("systemctl", &["--user", "enable", "--now", &svc])?;
+        let svc = instance(name);
+        // enable + restart (not `enable --now`) so a reinstall picks up a new binary/config.
+        let mut out = sh("systemctl", &["--user", "enable", &svc])?;
+        if out.status.success() {
+            out = sh("systemctl", &["--user", "restart", &svc])?;
+        }
         if !out.status.success() {
             bail!(
                 "✗ systemctl failed: {} → run: systemctl --user enable --now {svc}",
@@ -147,7 +155,7 @@ pub fn install(profile: &Profile) -> Result<()> {
         }
         println!("Tip: to keep it running after logout/reboot → run: loginctl enable-linger $USER");
     } else {
-        bail!("services are only supported on macOS and Linux → run: cc-telegram run {name}");
+        bail!("services are only supported on macOS and Linux → run: cc-gateway run {name}");
     }
     Ok(())
 }
@@ -160,19 +168,62 @@ pub fn uninstall(name: &str) -> Result<()> {
         );
         let _ = std::fs::remove_file(plist_path(name));
     } else {
-        let svc = format!("cc-telegram-{name}.service");
-        let _ = sh("systemctl", &["--user", "disable", "--now", &svc]);
-        let _ = std::fs::remove_file(unit_path(name));
-        let _ = sh("systemctl", &["--user", "daemon-reload"]);
+        let _ = sh(
+            "systemctl",
+            &["--user", "disable", "--now", &instance(name)],
+        );
+        // The template is shared: remove it only when no other profile still uses it.
+        if !crate::profile::list()
+            .iter()
+            .any(|n| n != name && is_installed(n))
+        {
+            let _ = std::fs::remove_file(unit_path());
+            let _ = sh("systemctl", &["--user", "daemon-reload"]);
+        }
     }
     Ok(())
+}
+
+/// Remove a pre-rename (cc-telegram) service for `name`, if present. Returns what was done.
+pub fn remove_legacy(name: &str) -> Vec<String> {
+    let mut done = vec![];
+    let home = dirs::home_dir().unwrap_or_default();
+    let label = format!("dev.opencraft.cc-telegram.{name}");
+    let plist = home.join(format!("Library/LaunchAgents/{label}.plist"));
+    if plist.exists() {
+        let _ = sh(
+            "launchctl",
+            &["bootout", &format!("{}/{label}", gui_domain())],
+        );
+        if std::fs::remove_file(&plist).is_ok() {
+            done.push(format!("removed old launchd agent {label}"));
+        }
+    }
+    let unit = format!("cc-telegram-{name}.service");
+    let unit_file = dirs::config_dir()
+        .unwrap_or_default()
+        .join("systemd/user")
+        .join(&unit);
+    if unit_file.exists() {
+        let _ = sh("systemctl", &["--user", "disable", "--now", &unit]);
+        if std::fs::remove_file(&unit_file).is_ok() {
+            let _ = sh("systemctl", &["--user", "daemon-reload"]);
+            done.push(format!("removed old systemd unit {unit}"));
+        }
+    }
+    done
 }
 
 pub fn is_installed(name: &str) -> bool {
     if cfg!(target_os = "macos") {
         plist_path(name).exists()
     } else {
-        unit_path(name).exists()
+        unit_path().exists()
+            && sh(
+                "systemctl",
+                &["--user", "is-enabled", "--quiet", &instance(name)],
+            )
+            .is_ok_and(|o| o.status.success())
     }
 }
 
@@ -189,12 +240,7 @@ pub fn is_running(name: &str) -> bool {
     } else {
         sh(
             "systemctl",
-            &[
-                "--user",
-                "is-active",
-                "--quiet",
-                &format!("cc-telegram-{name}.service"),
-            ],
+            &["--user", "is-active", "--quiet", &instance(name)],
         )
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -209,12 +255,12 @@ mod tests {
     fn plist_escapes_and_keeps_path() {
         let p = plist(
             "work",
-            Path::new("/Users/a&b/bin/cc-telegram"),
-            Path::new("/Users/a&b/.cc-telegram/profiles/work/logs"),
+            Path::new("/Users/a&b/bin/cc-gateway"),
+            Path::new("/Users/a&b/.cc-gateway/profiles/work/logs"),
             "/opt/homebrew/bin:/usr/bin",
             Path::new("/Users/a&b"),
         );
-        assert!(p.contains("<string>/Users/a&amp;b/bin/cc-telegram</string><string>run</string><string>work</string>"));
+        assert!(p.contains("<string>/Users/a&amp;b/bin/cc-gateway</string><string>run</string><string>work</string>"));
         assert!(p.contains("<key>KeepAlive</key><true/>"));
         assert!(p.contains("<key>PATH</key><string>/opt/homebrew/bin:/usr/bin</string>"));
         assert!(p.contains("profiles/work/logs/service.log"));
@@ -222,8 +268,9 @@ mod tests {
 
     #[test]
     fn unit_quotes_exec() {
-        let u = unit("work", Path::new("/home/a b/cc-telegram"), "/usr/bin:/bin");
-        assert!(u.contains("ExecStart=\"/home/a b/cc-telegram\" run work"));
+        let u = unit(Path::new("/home/a b/100%/cc-gateway"), "/usr/bin:/bin");
+        assert!(u.contains("ExecStart=\"/home/a b/100%%/cc-gateway\" run %i"));
+        assert_eq!(instance("work"), "cc-gateway@work.service");
         assert!(u.contains("Environment=\"PATH=/usr/bin:/bin\""));
         assert!(u.contains("Restart=always"));
     }

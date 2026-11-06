@@ -105,7 +105,7 @@ impl Found {
         let model = match &self.model {
             Some(m) => match map_model(m) {
                 Some(c) => format!("{m} (→ {c})"),
-                None => format!("{m} (not Claude, keeps cc-telegram default)"),
+                None => format!("{m} (not Claude, keeps cc-gateway default)"),
             },
             None => "none".into(),
         };

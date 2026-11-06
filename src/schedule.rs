@@ -1,8 +1,8 @@
 //! Per-user schedules.json + a once-a-minute cron loop (local time, no backfill).
 
 use crate::bot::App;
+use crate::bot::Job;
 use crate::profile::Profile;
-use crate::queue::Job;
 use crate::state::atomic_write;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Local, TimeZone, Timelike};
@@ -169,7 +169,7 @@ pub async fn run_loop(app: Arc<App>) {
                 .filter(|s| due(&s.cron, tick))
             {
                 tracing::info!(user_id = uid, id = s.id, "running schedule");
-                app.queues.push(
+                crate::bot::enqueue(
                     &app,
                     Job {
                         chat_id: s.chat_id,

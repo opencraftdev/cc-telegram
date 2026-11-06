@@ -17,6 +17,8 @@ You are direct, friendly and concise. You can use tools (shell, files, web) to g
 // No Debug derive on purpose: the token must never end up in logs.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
+    /// Telegram gateway: on when a token is set. Empty = API-only profile.
+    #[serde(default)]
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
@@ -32,9 +34,51 @@ pub struct Config {
     pub extra_claude_args: Vec<String>,
     #[serde(default)]
     pub voice: Voice,
+    #[serde(default)]
+    pub api: Api,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct Api {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "d_bind")]
+    pub bind: String,
+    #[serde(default = "d_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Only sha256 hashes are stored; the key itself is shown once at creation.
+    #[serde(default)]
+    pub keys: Vec<ApiKey>,
+}
+
+impl Default for Api {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: d_bind(),
+            max_concurrent: d_max_concurrent(),
+            keys: vec![],
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ApiKey {
+    pub name: String,
+    pub sha256: String,
+    pub created_at: String,
+}
+
+fn d_bind() -> String {
+    "127.0.0.1:8787".into()
+}
+fn d_max_concurrent() -> usize {
+    4
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct Voice {
     pub enabled: bool,
     pub whisper_bin: String,
@@ -47,7 +91,7 @@ impl Default for Voice {
         Self {
             enabled: false,
             whisper_bin: "whisper-cli".into(),
-            whisper_model: "~/.cc-telegram/models/ggml-base.bin".into(),
+            whisper_model: "~/.cc-gateway/models/ggml-base.bin".into(),
             language: "auto".into(),
         }
     }
@@ -77,7 +121,12 @@ impl Config {
             claude_bin: d_claude(),
             extra_claude_args: vec![],
             voice: Voice::default(),
+            api: Api::default(),
         }
+    }
+
+    pub fn telegram_enabled(&self) -> bool {
+        !self.bot_token.trim().is_empty()
     }
 
     pub fn is_allowed(&self, user_id: u64) -> bool {
@@ -88,7 +137,74 @@ impl Config {
 pub fn home() -> PathBuf {
     dirs::home_dir()
         .expect("no home directory")
-        .join(".cc-telegram")
+        .join(".cc-gateway")
+}
+
+/// Pre-rename leftovers (`~/.cc-telegram`): move the home once, fix old paths in configs
+/// (whenever any remain), and remove old launchd/systemd services. Best effort, each step
+/// reported on its own.
+pub fn migrate_home() {
+    let Some(h) = dirs::home_dir() else { return };
+    let (old, new) = (h.join(".cc-telegram"), home());
+    match move_home(&old, &new) {
+        Ok(true) => eprintln!(
+            "ℹ moved {} → {} (cc-telegram is now cc-gateway)",
+            old.display(),
+            new.display()
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "✗ could not move {} → {}: {e}",
+            old.display(),
+            new.display()
+        ),
+    }
+    match rewrite_old_paths(&profiles_dir(), &h) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("ℹ updated ~/.cc-telegram paths in {n} config file(s)"),
+        Err(e) => eprintln!(
+            "✗ could not update ~/.cc-telegram paths in configs: {e} → fix them: cc-gateway profile edit <profile>"
+        ),
+    }
+    let mut reinstall = false;
+    for name in list() {
+        for msg in crate::service::remove_legacy(&name) {
+            eprintln!("ℹ {msg}");
+            reinstall = true;
+        }
+    }
+    if reinstall {
+        eprintln!("ℹ reinstall background services with: cc-gateway service install <profile>");
+    }
+}
+
+fn move_home(old: &Path, new: &Path) -> Result<bool> {
+    if !old.is_dir() || new.exists() {
+        return Ok(false);
+    }
+    std::fs::rename(old, new)?;
+    Ok(true)
+}
+
+/// Replace `~/.cc-telegram/` and `<home>/.cc-telegram/` in every profile config. Idempotent.
+fn rewrite_old_paths(profiles: &Path, home_dir: &Path) -> Result<usize> {
+    let abs_old = format!("{}/.cc-telegram/", home_dir.display());
+    let abs_new = format!("{}/.cc-gateway/", home_dir.display());
+    let mut n = 0;
+    for e in std::fs::read_dir(profiles).into_iter().flatten().flatten() {
+        let p = e.path().join("config.toml");
+        let Ok(s) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let fixed = s
+            .replace("~/.cc-telegram/", "~/.cc-gateway/")
+            .replace(&abs_old, &abs_new);
+        if fixed != s {
+            atomic_write(&p, fixed.as_bytes(), 0o600)?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 pub fn profiles_dir() -> PathBuf {
@@ -138,7 +254,7 @@ impl Profile {
         validate_name(name)?;
         let dir = profiles_dir().join(name);
         if !dir.join("config.toml").exists() {
-            bail!("✗ profile {name:?} not found → run: cc-telegram profile create {name}");
+            bail!("✗ profile {name:?} not found → run: cc-gateway profile create {name}");
         }
         Ok(Self {
             name: name.into(),
@@ -149,9 +265,13 @@ impl Profile {
     /// Create the directory tree, config.toml (0600) and a default SOUL.md.
     pub fn create(name: &str, cfg: &Config) -> Result<Self> {
         validate_name(name)?;
+        Self::create_at(profiles_dir().join(name), name, cfg)
+    }
+
+    pub fn create_at(dir: PathBuf, name: &str, cfg: &Config) -> Result<Self> {
         let p = Self {
             name: name.into(),
-            dir: profiles_dir().join(name),
+            dir,
         };
         for d in [p.logs_dir(), p.dir.join("users"), p.workspace()] {
             std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
@@ -173,6 +293,9 @@ impl Profile {
     pub fn state_path(&self) -> PathBuf {
         self.dir.join("state.json")
     }
+    pub fn sessions_path(&self) -> PathBuf {
+        self.dir.join("sessions.json")
+    }
     pub fn pair_path(&self) -> PathBuf {
         self.dir.join("pair.json")
     }
@@ -180,7 +303,11 @@ impl Profile {
         self.dir.join("logs")
     }
     pub fn user_dir(&self, uid: u64) -> PathBuf {
-        self.dir.join("users").join(uid.to_string())
+        self.ns_dir(&uid.to_string())
+    }
+    /// Memory namespace: a Telegram user id, or `key-<name>` for an API key.
+    pub fn ns_dir(&self, ns: &str) -> PathBuf {
+        self.dir.join("users").join(ns)
     }
     /// Imported (e.g. Hermes) memory waiting for its owner to pair.
     pub fn imported_dir(&self) -> PathBuf {
@@ -243,7 +370,7 @@ impl Profile {
             .with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&s).with_context(|| {
             format!(
-                "✗ invalid {} → run: cc-telegram profile edit {}",
+                "✗ invalid {} → run: cc-gateway profile edit {}",
                 path.display(),
                 self.name
             )
@@ -325,11 +452,16 @@ impl PairStore {
     }
 }
 
-fn random_u32() -> Result<u32> {
+pub fn random_bytes(n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
-    let mut b = [0u8; 4];
+    let mut b = vec![0u8; n];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
+    Ok(b)
+}
+
+fn random_u32() -> Result<u32> {
+    let b = random_bytes(4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 #[cfg(test)]
@@ -353,6 +485,43 @@ mod tests {
         assert_eq!(c.run_timeout_secs, 900);
         assert!(!c.voice.enabled);
         assert!(c.allowed_user_ids.is_empty());
+        assert!(c.telegram_enabled() && !c.api.enabled);
+        // partial tables keep the other fields' defaults
+        let c: Config =
+            toml::from_str("[voice]\nenabled = true\n[api]\nbind = \"127.0.0.1:9\"\n").unwrap();
+        assert!(c.voice.enabled);
+        assert_eq!(c.voice.whisper_bin, "whisper-cli");
+        assert_eq!(c.voice.language, "auto");
+        assert_eq!(
+            (c.api.bind.as_str(), c.api.max_concurrent),
+            ("127.0.0.1:9", 4)
+        );
+    }
+
+    #[test]
+    fn migrates_old_home_once_and_rewrites_paths() {
+        let t = tempfile::tempdir().unwrap();
+        let (old, new) = (t.path().join(".cc-telegram"), t.path().join(".cc-gateway"));
+        let cfg = old.join("profiles/default/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let abs = format!("{}/.cc-telegram/bin/claude", t.path().display());
+        std::fs::write(
+            &cfg,
+            format!(
+                "claude_bin = \"{abs}\"\n[voice]\nwhisper_model = \"~/.cc-telegram/models/m.bin\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(move_home(&old, &new).unwrap());
+        assert!(!old.exists());
+        assert!(!move_home(&old, &new).unwrap()); // nothing left to move
+        let profiles = new.join("profiles");
+        assert_eq!(rewrite_old_paths(&profiles, t.path()).unwrap(), 1);
+        let s = std::fs::read_to_string(profiles.join("default/config.toml")).unwrap();
+        assert!(s.contains("~/.cc-gateway/models/m.bin"));
+        assert!(s.contains(&format!("{}/.cc-gateway/bin/claude", t.path().display())));
+        assert!(!s.contains(".cc-telegram"));
+        assert_eq!(rewrite_old_paths(&profiles, t.path()).unwrap(), 0); // idempotent
     }
 
     #[test]

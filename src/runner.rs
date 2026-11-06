@@ -28,6 +28,10 @@ pub struct RunResult {
     pub cost_usd: f64,
     pub is_error: bool,
     pub errors: Vec<String>,
+    /// Prompt-side tokens (input + cache read/creation) and output tokens, 0 if not reported.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub duration_ms: u64,
 }
 
 impl RunResult {
@@ -37,21 +41,26 @@ impl RunResult {
     }
 }
 
-/// Error text that means the `--resume` session is missing or corrupt.
+/// The error claude prints for a `--resume` id it doesn't have (verified against claude 2.1.x:
+/// "No conversation found with session ID: <id>").
 pub fn is_stale_text(text: &str) -> bool {
-    let all = text.to_lowercase();
-    let session_gone = all.contains("session")
-        && ["not found", "invalid", "corrupt"]
-            .iter()
-            .any(|w| all.contains(w));
-    all.contains("no conversation found") || session_gone
+    text.to_lowercase()
+        .contains("no conversation found with session id")
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Event {
     Init(String),
-    Tool(String),
+    Tool { name: String, input: String },
+    Text(String),
     Result(RunResult),
+}
+
+impl Event {
+    /// Status-line form of a tool step (Telegram).
+    pub fn tool_line(name: &str, input: &str) -> String {
+        format!("🔧 {name}: {input}")
+    }
 }
 
 #[derive(Debug)]
@@ -103,10 +112,13 @@ pub fn parse_line(line: &str) -> Vec<Event> {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|b| b["type"] == "tool_use")
-            .map(|b| {
-                let name = b["name"].as_str().unwrap_or("tool");
-                Event::Tool(format!("🔧 {name}: {}", short_input(&b["input"])))
+            .filter_map(|b| match b["type"].as_str() {
+                Some("tool_use") => Some(Event::Tool {
+                    name: b["name"].as_str().unwrap_or("tool").to_string(),
+                    input: short_input(&b["input"]),
+                }),
+                Some("text") => s(&b["text"]).filter(|t| !t.is_empty()).map(Event::Text),
+                _ => None,
             })
             .collect(),
         Some("result") => vec![Event::Result(RunResult {
@@ -120,6 +132,16 @@ pub fn parse_line(line: &str) -> Vec<Event> {
                 .flatten()
                 .filter_map(s)
                 .collect(),
+            input_tokens: [
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ]
+            .iter()
+            .filter_map(|k| v["usage"][*k].as_u64())
+            .sum(),
+            output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            duration_ms: v["duration_ms"].as_u64().unwrap_or(0),
         })],
         _ => vec![],
     }
@@ -177,8 +199,8 @@ pub fn kill_all() {
 /// How long claude gets to exit (and stderr to drain) after its `result` / EOF.
 const GRACE: Duration = Duration::from_secs(5);
 
-/// Run claude; tool steps go to `steps`. `stop` cancels the run.
-pub async fn run(o: &RunOpts, steps: mpsc::UnboundedSender<String>, stop: Arc<Notify>) -> Outcome {
+/// Run claude; Init/Tool/Text events go to `steps` as they stream. `stop` cancels the run.
+pub async fn run(o: &RunOpts, steps: mpsc::UnboundedSender<Event>, stop: Arc<Notify>) -> Outcome {
     let mut child = match Command::new(&o.claude_bin)
         .args(build_args(o))
         .current_dir(&o.cwd)
@@ -202,7 +224,7 @@ pub async fn run(o: &RunOpts, steps: mpsc::UnboundedSender<String>, stop: Arc<No
 async fn drive(
     o: &RunOpts,
     child: &mut tokio::process::Child,
-    steps: mpsc::UnboundedSender<String>,
+    steps: mpsc::UnboundedSender<Event>,
     stop: Arc<Notify>,
 ) -> Outcome {
     let pid = child.id();
@@ -222,9 +244,11 @@ async fn drive(
             line = lines.next_line() => match line {
                 Ok(Some(l)) => for ev in parse_line(&l) {
                     match ev {
-                        Event::Init(id) => session = Some(id),
-                        Event::Tool(t) => { let _ = steps.send(t); }
                         Event::Result(r) => result = Some(r),
+                        ev => {
+                            if let Event::Init(id) = &ev { session = Some(id.clone()); }
+                            let _ = steps.send(ev);
+                        }
                     }
                 },
                 _ => break None,
@@ -295,17 +319,23 @@ mod tests {
         assert_eq!(
             parse_line(tool),
             vec![
-                Event::Tool("🔧 Bash: echo hi there".into()),
-                Event::Tool("🔧 Read: /a/b.rs".into())
+                Event::Tool {
+                    name: "Bash".into(),
+                    input: "echo hi there".into()
+                },
+                Event::Tool {
+                    name: "Read".into(),
+                    input: "/a/b.rs".into()
+                }
             ]
         );
-        assert!(
+        assert_eq!(
             parse_line(
                 r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#
-            )
-            .is_empty()
+            ),
+            vec![Event::Text("done".into())]
         );
-        let res = r#"{"type":"result","subtype":"success","is_error":false,"result":"hi","session_id":"s1","total_cost_usd":0.0075,"usage":{}}"#;
+        let res = r#"{"type":"result","subtype":"success","is_error":false,"result":"hi","session_id":"s1","total_cost_usd":0.0075,"duration_ms":1200,"usage":{"input_tokens":2,"cache_read_input_tokens":10,"cache_creation_input_tokens":5,"output_tokens":7}}"#;
         assert_eq!(
             parse_line(res),
             vec![Event::Result(RunResult {
@@ -314,6 +344,9 @@ mod tests {
                 cost_usd: 0.0075,
                 is_error: false,
                 errors: vec![],
+                input_tokens: 17,
+                output_tokens: 7,
+                duration_ms: 1200,
             })]
         );
         assert!(parse_line("not json").is_empty());
@@ -335,6 +368,7 @@ mod tests {
         // stderr-only failure from a bogus --resume
         assert!(is_stale_text("No conversation found with session ID: 0000"));
         assert!(!is_stale_text("Error: rate limited"));
+        assert!(!is_stale_text("invalid session token for MCP server"));
     }
 
     #[tokio::test]
@@ -413,7 +447,14 @@ echo '{"type":"result","result":"done","session_id":"s9","total_cost_usd":0.01,"
             panic!()
         };
         assert_eq!(r.text, "done");
-        assert_eq!(rx.recv().await.unwrap(), "🔧 Bash: ls");
+        assert_eq!(rx.recv().await.unwrap(), Event::Init("s9".into()));
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            Event::Tool {
+                name: "Bash".into(),
+                input: "ls".into()
+            }
+        );
 
         // A grandchild that would outlive a plain child kill.
         let marker = std::env::temp_dir().join(format!("cct-marker-{}", std::process::id()));

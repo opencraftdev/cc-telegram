@@ -1,9 +1,9 @@
 //! Telegram side: dispatcher, allowlist filter, chat commands, and running one job end to end.
 
 use crate::profile::{PairStore, Profile, Redeem};
-use crate::queue::{Job, Queues};
+use crate::queue::Queues;
 use crate::runner::{self, Outcome, RunOpts, truncate};
-use crate::state::StateStore;
+use crate::state::{SessionOwners, StateStore};
 use crate::{media, prompt, schedule};
 use anyhow::Result;
 use std::path::Path;
@@ -20,15 +20,38 @@ pub struct App {
     pub bot: Bot,
     pub profile: Profile,
     pub state: StateStore,
-    pub queues: Queues,
+    pub queues: Arc<Queues>,
+    pub owners: Arc<SessionOwners>,
 }
 
-pub async fn run(profile: Profile) -> Result<()> {
+pub struct Job {
+    pub chat_id: i64,
+    pub user_id: u64,
+    pub prompt: String,
+    /// Cron runs: fresh session, output prefixed with ⏰.
+    pub scheduled: bool,
+}
+
+fn tg_key(chat: i64) -> String {
+    format!("tg:{chat}")
+}
+
+/// Put a job on its chat's FIFO queue.
+pub fn enqueue(app: &Arc<App>, job: Job) {
+    let a = app.clone();
+    app.queues.push(
+        &tg_key(job.chat_id),
+        Box::new(move |stop| Box::pin(async move { run_job(&a, job, stop).await })),
+    );
+}
+
+/// The Telegram gateway: long polling until the process exits.
+pub async fn run(profile: Profile, queues: Arc<Queues>, owners: Arc<SessionOwners>) -> Result<()> {
     let cfg = profile.load_config()?;
     let bot = Bot::new(&cfg.bot_token);
     let me = bot.get_me().await.map_err(|e| {
         anyhow::anyhow!(
-            "✗ token rejected by Telegram ({e}) → run: cc-telegram profile edit {}",
+            "✗ token rejected by Telegram ({e}) → run: cc-gateway profile edit {}",
             profile.name
         )
     })?;
@@ -37,10 +60,10 @@ pub async fn run(profile: Profile) -> Result<()> {
         bot: bot.clone(),
         state: StateStore::open(profile.state_path()),
         profile,
-        queues: Queues::default(),
+        queues,
+        owners,
     });
     tokio::spawn(schedule::run_loop(app.clone()));
-    tokio::spawn(shutdown_on_signal());
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message))
@@ -72,13 +95,13 @@ pub fn conflict_hint(profile: &str) -> String {
     format!(
         "✗ Telegram 409 Conflict: another bot instance is polling with this token. If it's Hermes \
          Agent, stop its gateway → run: hermes gateway stop (or: hermes -p <name> gateway stop); \
-         or give profile {profile} its own bot → run: cc-telegram profile edit {profile}"
+         or give profile {profile} its own bot → run: cc-gateway profile edit {profile}"
     )
 }
 
 /// launchd/systemd stop us with SIGTERM: claude runs live in their own process groups, so
 /// kill those first or they'd outlive the daemon.
-async fn shutdown_on_signal() {
+pub async fn shutdown_on_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int)) = (
         signal(SignalKind::terminate()),
@@ -174,7 +197,7 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
                 return Ok(());
             }
             "stop" => {
-                let text = match app.queues.stop(chat.0) {
+                let text = match app.queues.stop(&tg_key(chat.0)) {
                     (false, 0) => "Nothing running.".to_string(),
                     (running, n) => format!(
                         "🛑 {}cleared {n} queued job(s).",
@@ -190,7 +213,7 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
             }
             "status" => {
                 let cs = app.state.get(chat.0);
-                let (queued, running) = app.queues.info(chat.0);
+                let (queued, running) = app.queues.info(&tg_key(chat.0));
                 reply(format!(
                     "Model: {}\nSession: {}\nQueued: {queued}\nRunning: {}\nLast run cost: {}",
                     cs.model.as_deref().unwrap_or(&cfg.default_model),
@@ -305,7 +328,7 @@ async fn on_message(app: Arc<App>, msg: Message) -> Result<()> {
             return Ok(());
         }
     };
-    app.queues.push(
+    enqueue(
         &app,
         Job {
             chat_id: chat.0,
@@ -403,9 +426,10 @@ async fn try_run_job(app: &Arc<App>, job: &Job, stop: Arc<Notify>) -> Result<()>
     let secs = started.elapsed().as_secs();
     // If the user sent /new while this ran (epoch changed), don't store this run's session.
     let keep_session = |sid: Option<String>| {
-        if !job.scheduled
-            && let Some(sid) = sid
-        {
+        let Some(sid) = sid else { return };
+        // Mark the session as this chat's so no API key can resume it.
+        app.owners.claim(&sid, &format!("tg:{}", chat.0));
+        if !job.scheduled {
             app.state.set_session_if(chat.0, cs_epoch, sid);
         }
     };
@@ -459,7 +483,7 @@ async fn try_run_job(app: &Arc<App>, job: &Job, stop: Arc<Notify>) -> Result<()>
             app.bot
                 .send_message(
                     chat,
-                    format!("✗ claude failed: {err}\n→ run: cc-telegram doctor"),
+                    format!("✗ claude failed: {err}\n→ run: cc-gateway doctor"),
                 )
                 .await?;
             format!("{header}✗ failed")
@@ -481,7 +505,7 @@ async fn run_with_status(
     opts: &RunOpts,
     stop: Arc<Notify>,
 ) -> Outcome {
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<runner::Event>();
     let ui = async {
         let mut lines: Vec<String> = vec![];
         let mut dirty = false;
@@ -490,11 +514,12 @@ async fn run_with_status(
         loop {
             tokio::select! {
                 step = rx.recv() => match step {
-                    Some(l) => {
-                        lines.push(l);
+                    Some(runner::Event::Tool { name, input }) => {
+                        lines.push(runner::Event::tool_line(&name, &input));
                         if lines.len() > 10 { lines.remove(0); }
                         dirty = true;
                     }
+                    Some(_) => {}
                     None => break,
                 },
                 _ = edit.tick() => if dirty && let Some(id) = status {
