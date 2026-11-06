@@ -10,6 +10,15 @@ It checks claude (installed, logged in), `~/.cc-gateway` permissions, and for ev
 
 Logs: `~/.cc-gateway/profiles/<profile>/logs/bot.log`. On macOS, `logs/service.log` also has the service's stdout/stderr. Use `RUST_LOG=debug cc-gateway run <profile>` for more detail.
 
+## Seeing what the bot sees
+
+```bash
+cc-gateway prompt <profile> --chat <chat_id>             # the exact system prompt for that chat right now
+cc-gateway ask <profile> --chat <chat_id> --dry "halo"   # one turn, reply on stdout, nothing changed
+```
+
+`--chat` is the Telegram chat id (for a DM, the user's id; pass `--user <id>` for groups). `ask` without `--dry` behaves like a real message: it resumes and saves the chat's session and may edit memory. `--dry` forks the session without saving it, blocks file and shell tools, and leaves state.json untouched. `--model` overrides the model for this turn. Set `CC_GATEWAY_HOME` to use a data folder other than `~/.cc-gateway`.
+
 ## Telegram 409 Conflict
 
 ```

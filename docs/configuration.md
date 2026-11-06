@@ -65,4 +65,6 @@ created_at = "2026-11-06T10:00:00+07:00"
 | `workspace/.claude/skills/` | Claude Code skills available to every run (flat: `<name>/SKILL.md`) |
 | `workspace/scripts/` | Scripts for command jobs (e.g. imported from Hermes) |
 
+The data folder is `~/.cc-gateway`, or `$CC_GATEWAY_HOME` if set.
+
 Log verbosity: set `RUST_LOG`, for example `RUST_LOG=debug cc-gateway run <profile>`. The default is `info`.

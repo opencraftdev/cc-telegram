@@ -34,6 +34,7 @@ Repository: `github.com/opencraftdev/cc-gateways` (renamed from `cc-telegram`).
 | 25 | History import | Hermes `state.db` (read-only, immutable) → last 30 user/assistant messages per allowlisted Telegram chat in `users/<chat>/HISTORY.md`, injected only until that chat's first session is stored. |
 | 26 | Working dir | Optional `workdir` (imported from Hermes `terminal.cwd` / `TERMINAL_CWD` when absolute): claude's cwd; the workspace is then passed with `--add-dir`, which keeps its skills loaded. |
 | 27 | Flaky networks | getMe errors are classified: only HTTP 401/404 = "token rejected"; anything else = "can't reach Telegram (network)", retried (CLI: 8×, 1s→16s; bot startup: forever, cap 5 min). api.telegram.org also resolves to Telegram's seed IPs after the DNS answer. A typing indicator runs from message acceptance to the last file sent (4s, 3s-capped requests). |
+| 28 | Debugging turns | `prompt` prints a chat's exact system prompt; `ask` runs one turn like Telegram (same prompt, resume, cwd, skills; the run cap is this process's own) and prints the reply. `--dry` changes nothing: a resumed session is forked (`--fork-session`) and nothing persisted (`--no-session-persistence`), Edit/Write/MultiEdit/NotebookEdit/Bash are disallowed, and the prompt says not to touch files. Greeting guidance: introduce yourself per SOUL and mention what you last worked on together. |
 | 23 | Multi-profile | `cc-gateway run --all` runs every profile in one process; `service install --all` installs one unit for it and refuses if per-profile units exist (double polling → 409). |
 
 > Why Rust: a single-binary distribution for others to use. It does **not** improve agent memory (that lives in markdown + Claude sessions) or meaningfully reduce RAM (each `claude` process is ~200–400MB of Node no matter what).
@@ -170,6 +171,8 @@ cc-gateway service install <name>|--all   # launchd/systemd, auto-restart
 cc-gateway service uninstall <name>|--all
 cc-gateway service status <name>|--all
 cc-gateway doctor                     # checks claude, ffmpeg, whisper-cli, token validity
+cc-gateway prompt <profile> --chat <id> [--user <id>]          # print the system prompt that chat gets now
+cc-gateway ask <profile> --chat <id> [--user <id>] [--dry] [--model m] "<message>"   # one headless turn
 cc-gateway import hermes [--only <name>]... [--profile <name>] [--hermes-home <path>] [--yes]
 ```
 
@@ -283,7 +286,7 @@ Served by axum on `[api] bind`. Auth runs as middleware before any request body 
 
 | Command | Action |
 |---------|--------|
-| `/start` | Greeting + your user id (non-allowlisted users get silence; their id goes to the log only) |
+| `/start` | Allowlisted: a normal turn with the message `/start (user opened the chat — greet them)`, so the greeting is in character and picks up the last session / imported history. Non-allowlisted users get silence; their id goes to the log only. |
 | `/new` | Drop the chat's session id (memory files stay) |
 | `/stop` | Kill the running claude process for this chat and clear the queue |
 | `/status` | Model, session id (short), queue length, running time, last run cost |

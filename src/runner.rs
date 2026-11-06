@@ -96,7 +96,8 @@ pub fn build_args(o: &RunOpts) -> Vec<String> {
     a.extend(o.extra_args.iter().cloned());
     // `--` so a prompt starting with '-' is never parsed as a flag.
     a.extend(["--".to_string(), o.prompt.clone()]);
-    a
+    // A NUL byte anywhere (a file, a user message) would make spawn fail outright.
+    a.into_iter().map(|x| x.replace('\0', "")).collect()
 }
 
 /// Parse one stream-json line. Unknown events / fields are ignored.
@@ -459,6 +460,12 @@ sleep 20 &"#,
         assert_eq!(a[pos("--max-turns") + 1], "3");
         assert_eq!(a[pos("--append-system-prompt") + 1], "sys");
         assert!(pos("--add-dir") < pos("--"));
+        let mut o = o;
+        o.prompt = "a\0b".into();
+        o.system_prompt = "s\0".into();
+        let a = build_args(&o);
+        assert!(a.iter().all(|x| !x.contains('\0')));
+        assert_eq!(a.last().unwrap(), "ab");
     }
 
     fn fake_opts(script: &str, timeout: Duration) -> RunOpts {

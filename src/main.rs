@@ -54,6 +54,30 @@ enum Cmd {
     Service(ServiceCmd),
     /// Check claude, login, tokens, service, ffmpeg, whisper, permissions
     Doctor,
+    /// Print the system prompt a chat would get right now (debugging)
+    Prompt {
+        profile: String,
+        #[arg(long)]
+        chat: i64,
+        /// Sender's Telegram user id (default: the chat id, i.e. a DM)
+        #[arg(long)]
+        user: Option<u64>,
+    },
+    /// Run one turn for a chat exactly like Telegram would, print the reply
+    Ask {
+        profile: String,
+        #[arg(long)]
+        chat: i64,
+        /// Sender's Telegram user id (default: the chat id, i.e. a DM)
+        #[arg(long)]
+        user: Option<u64>,
+        /// No state changes: forked, unsaved session; no file or shell tools
+        #[arg(long)]
+        dry: bool,
+        #[arg(long)]
+        model: Option<String>,
+        message: String,
+    },
     /// Import from another agent
     #[command(subcommand)]
     Import(ImportCmd),
@@ -253,6 +277,19 @@ async fn real_main() -> Result<()> {
             }
         },
         Some(Cmd::Doctor) => setup::doctor().await,
+        Some(Cmd::Prompt {
+            profile,
+            chat,
+            user,
+        }) => bot::print_prompt(&Profile::open(&profile)?, chat, user),
+        Some(Cmd::Ask {
+            profile,
+            chat,
+            user,
+            dry,
+            model,
+            message,
+        }) => bot::ask(&Profile::open(&profile)?, chat, user, &message, model, dry).await,
         Some(Cmd::Import(ImportCmd::Hermes {
             profile,
             hermes_home,
